@@ -1,0 +1,20 @@
+{
+  "name": "freelancer-slack-bot",
+  "version": "1.0.0",
+  "description": "Slack bot that recommends freelancers from a Google Sheet using Claude AI",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@slack/bolt": "^4.1.0",
+    "googleapis": "^144.0.0",
+    "cheerio": "^1.0.0",
+    "dotenv": "^16.4.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
