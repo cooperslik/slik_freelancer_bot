@@ -29,6 +29,7 @@ const sheets = google.sheets({
 });
 
 const SPREADSHEET_ID = process.env.GOOGLE_SPREADSHEET_ID;
+const TEAM_SPREADSHEET_ID = process.env.GOOGLE_TEAM_SPREADSHEET_ID || null;
 
 // ── Tabs we care about (skip "REQUESTS" tab) ────────────────────────
 
@@ -50,6 +51,8 @@ const FREELANCER_TABS = [
 
 let rosterCache = null;
 let cacheTimestamp = 0;
+let teamCache = null;
+let teamCacheTimestamp = 0;
 const CACHE_TTL_MS = 60 * 1000; // 1 minute — fresh enough for live data, avoids hammering the API
 
 // ── Read entire freelancer roster from Google Sheets ─────────────────
@@ -95,6 +98,71 @@ async function fetchRoster() {
   rosterCache = roster;
   cacheTimestamp = Date.now();
   return roster;
+}
+
+// ── Read internal studio team from Google Sheets ─────────────────────
+
+async function fetchTeam() {
+  if (!TEAM_SPREADSHEET_ID) return [];
+
+  if (teamCache && Date.now() - teamCacheTimestamp < CACHE_TTL_MS) {
+    return teamCache;
+  }
+
+  try {
+    const { data } = await sheets.spreadsheets.values.get({
+      spreadsheetId: TEAM_SPREADSHEET_ID,
+      range: "A1:Z",
+    });
+
+    const rows = data.values || [];
+    if (rows.length < 2) return [];
+
+    const headers = rows[0].map((h) => h.trim());
+    console.log(`👥 Team sheet — Headers: [${headers.join(", ")}]`);
+
+    const team = [];
+    for (let i = 1; i < rows.length; i++) {
+      const row = rows[i];
+      if (!row[0] || !row[0].trim()) continue;
+
+      const entry = { Source: "Internal Team" };
+      headers.forEach((header, col) => {
+        entry[header] = (row[col] || "").trim();
+      });
+      team.push(entry);
+    }
+
+    console.log(`👥 Team sheet — ${team.length} team members loaded`);
+    teamCache = team;
+    teamCacheTimestamp = Date.now();
+    return team;
+  } catch (err) {
+    console.warn("⚠️ Could not read internal team sheet:", err.message);
+    return [];
+  }
+}
+
+// ── Format internal team as a readable string for Claude ─────────────
+
+function formatTeamForPrompt(team) {
+  if (team.length === 0) return "";
+
+  let text = "\n\n═══ INTERNAL STUDIO TEAM ═══\n";
+  for (const p of team) {
+    text += `\n• ${p.Name || "Unknown"}`;
+    if (p.Role) text += ` | Role: ${p.Role}`;
+    if (p.Level) text += ` | Level: ${p.Level}`;
+    if (p["Cost Rate ( per 8hr day)"] || p["Cost Rate (per 8hr day)"])
+      text += ` | Day Rate: ${p["Cost Rate ( per 8hr day)"] || p["Cost Rate (per 8hr day)"]}`;
+    if (p.Capabilites || p.Capabilities)
+      text += `\n  Capabilities: ${p.Capabilites || p.Capabilities}`;
+    if (p.Clients) text += `\n  Previous Clients: ${p.Clients}`;
+    if (p.Location) text += `\n  Location: ${p.Location}`;
+    if (p.Comments) text += `\n  Comments: ${p.Comments}`;
+    text += "\n";
+  }
+  return text;
 }
 
 // ── Format roster as a readable string for Claude ────────────────────
@@ -283,31 +351,47 @@ function extractNamesFromReply(reply) {
 
 // ── System prompt for Claude ─────────────────────────────────────────
 
-const SYSTEM_PROMPT = `You are the Freelancer Finder — an AI assistant for a creative advertising agency. Your job is to recommend the TOP 3 best-fit freelancers from the agency's roster based on project briefs and requirements.
+const SYSTEM_PROMPT = `You are the Talent Finder — an AI assistant for a creative advertising agency. Your job is to recommend the best people for a project, always checking the INTERNAL STUDIO TEAM first before suggesting freelancers.
 
-HOW TO RANK CANDIDATES:
-When evaluating freelancers against a request, weigh ALL of the following columns — not just the category or job title:
+PRIORITY ORDER:
+1. **Internal team members FIRST** — the agency always prefers to use in-house talent if someone suitable is available. Check the internal team data carefully.
+2. **Freelancers as backup** — recommend freelancers when no internal team member fits, or as additional options alongside an internal pick.
+
+HOW TO EVALUATE CANDIDATES (both internal and freelancers):
 - **Capabilities**: Does their skill set directly match what the project needs?
-- **Comments/Notes**: This is critical — it contains details about specific projects they've worked on, niche strengths, software proficiency, working style, and internal feedback. Treat this as the richest signal for fit.
-- **Previous Clients**: Have they worked on similar brands, industries, or campaign types? A freelancer who's done work for a comparable client is a stronger match.
-- **Level**: Does the seniority match what the project demands? A quick social content job doesn't need a senior CD; a hero brand campaign does.
+- **Role/Category**: Does their discipline align with the work required?
+- **Comments/Notes**: This is critical — it contains details about specific projects they've worked on, niche strengths, software proficiency, working style, and internal feedback. Use this to identify if someone has worked on a similar project before, or with the same client. If so, call this out prominently (e.g. "Randle worked on the previous iteration of this brand campaign — worth looping him in for continuity").
+- **Previous Clients**: Have they worked on similar brands, industries, or campaign types? Someone with direct client experience is a much stronger match.
+- **Level**: Does the seniority match what the project demands?
 - **Recommendation**: Internal recommendation score or notes — factor this into confidence.
-- **Availability & Status**: Strongly prefer freelancers who are marked as available. Flag availability concerns if recommending someone who may be busy.
+- **Availability & Status**: Strongly prefer people who are marked as available. Flag concerns if recommending someone who may be busy.
 - **Cost Rate (per 8hr day)**: Always show this. If the requester mentions a budget, filter accordingly.
 - **Location**: Only factor this in if the requester mentions on-site, local, or timezone needs.
 
 RULES:
-1. Always recommend exactly 3 candidates, ranked #1 to #3 by overall fit. If fewer than 3 are a reasonable match, recommend as many as fit and explain why there aren't more.
-2. Only recommend freelancers who appear in the roster data provided. Never invent people.
-3. Never share phone numbers or email addresses in the channel. If someone needs contact details, tell them to check the sheet directly.
-4. Keep responses concise and scannable — this is Slack, not an email.
-5. If the request is vague (e.g. "I need a designer"), ask a clarifying question about the type of work, budget, timeline, or seniority before recommending.
+1. Always check the internal team first. If a strong internal match exists, lead with them.
+2. Always recommend 3 freelancer options alongside any internal recommendations.
+3. Only recommend people who appear in the data provided. Never invent people.
+4. Never share phone numbers or email addresses in the channel.
+5. Keep responses concise and scannable — this is Slack, not an email.
+6. If the request is vague, ask a clarifying question before recommending.
+7. If an internal team member has worked on a related project or with the same client (based on Comments or Previous Clients), always highlight this — it's extremely valuable context.
 
 FORMAT your responses exactly like this:
 
+🏠 *Internal Team*
+[If a match is found:]
+*Name* — Role | Level | $X/day
+_Why:_ [2-3 sentences — highlight any relevant project history, client experience, or continuity value]
+
+[If no internal match:]
+_No strong internal match for this brief — recommending freelancers below._
+
+---
+
 🥇 *#1 — Name*
 Category | Level | $X/day
-_Why:_ [2-3 sentences explaining why they're the best fit — reference their specific capabilities, relevant project experience from Comments, and any notable previous clients]
+_Why:_ [2-3 sentences — reference capabilities, relevant project experience from Comments, and notable previous clients]
 
 🥈 *#2 — Name*
 Category | Level | $X/day
@@ -317,7 +401,44 @@ _Why:_ [2-3 sentences]
 Category | Level | $X/day
 _Why:_ [2-3 sentences]
 
-💡 *Note:* [Optional — add a brief note about availability, budget considerations, or if the requester should consider combining two freelancers for the project]`;
+💡 *Note:* [Optional — availability, budget considerations, or suggestions about combining internal + freelance resources]`;
+
+// ── Thread history — gives the bot memory in conversations ───────────
+
+async function getThreadHistory(channel, threadTs, botUserId) {
+  if (!threadTs) return [];
+
+  try {
+    const result = await slack.client.conversations.replies({
+      channel,
+      ts: threadTs,
+      limit: 20, // last 20 messages in the thread — plenty of context
+    });
+
+    const messages = result.messages || [];
+    const history = [];
+
+    for (const msg of messages) {
+      // Skip the "thinking" messages
+      if (msg.text === "🔍 Checking the freelancer roster...") continue;
+
+      // Clean bot mentions from text
+      const cleanText = msg.text.replace(/<@[A-Z0-9]+>/g, "").trim();
+      if (!cleanText) continue;
+
+      if (msg.bot_id || msg.user === botUserId) {
+        history.push({ role: "assistant", content: cleanText });
+      } else {
+        history.push({ role: "user", content: cleanText });
+      }
+    }
+
+    return history;
+  } catch (error) {
+    console.error("Error fetching thread history:", error.message);
+    return [];
+  }
+}
 
 // ── Handle messages that mention the bot ──────────────────────────────
 
@@ -328,39 +449,87 @@ slack.event("app_mention", async ({ event, say }) => {
   if (!query) {
     await say({
       text: "Hey! Tell me what kind of project you need a freelancer for and I'll check the roster. For example: _We need a senior motion designer for a 3-week brand campaign with 3D experience._",
-      thread_ts: event.ts,
+      thread_ts: event.thread_ts || event.ts,
     });
     return;
   }
 
+  // Reply in the existing thread if this is a follow-up, or start a new thread
+  const threadTs = event.thread_ts || event.ts;
+
   // Show a thinking indicator
   const thinking = await say({
-    text: "🔍 Checking the freelancer roster...",
-    thread_ts: event.ts,
+    text: "🔍 Checking the team and freelancer roster...",
+    thread_ts: threadTs,
   });
 
   try {
-    // Fetch latest roster data from Google Sheets
-    const roster = await fetchRoster();
+    // Fetch latest data from both sheets
+    const [roster, team] = await Promise.all([fetchRoster(), fetchTeam()]);
     const rosterText = formatRosterForPrompt(roster);
+    const teamText = formatTeamForPrompt(team);
+    const allData = teamText + "\n" + rosterText;
+
+    // Check if this is a follow-up in an existing thread
+    const isFollowUp = !!event.thread_ts;
+    let messages = [];
+
+    if (isFollowUp) {
+      // Get the bot's user ID for identifying its own messages
+      const authResult = await slack.client.auth.test();
+      const botUserId = authResult.user_id;
+
+      // Fetch thread history and build multi-turn conversation
+      const threadHistory = await getThreadHistory(
+        event.channel,
+        event.thread_ts,
+        botUserId
+      );
+
+      // Start with the roster context, then add the conversation history
+      if (threadHistory.length > 0) {
+        // Insert roster into the first user message
+        const firstMsg = threadHistory[0];
+        messages.push({
+          role: "user",
+          content: `Here is the internal team and freelancer roster:\n${allData}\n\n---\n\n${firstMsg.content}`,
+        });
+
+        // Add remaining history (skip first since we merged it above)
+        for (let i = 1; i < threadHistory.length; i++) {
+          messages.push(threadHistory[i]);
+        }
+
+        // Add the new follow-up question
+        messages.push({
+          role: "user",
+          content: query,
+        });
+      }
+    }
+
+    // Fall back to single message if no thread history
+    if (messages.length === 0) {
+      messages = [
+        {
+          role: "user",
+          content: `Here is the internal team and freelancer roster:\n${allData}\n\n---\n\nRequest: ${query}`,
+        },
+      ];
+    }
 
     // Ask Claude
     const response = await anthropic.messages.create({
       model: "claude-sonnet-4-20250514",
       max_tokens: 1024,
       system: SYSTEM_PROMPT,
-      messages: [
-        {
-          role: "user",
-          content: `Here is the current freelancer roster:\n${rosterText}\n\n---\n\nRequest: ${query}`,
-        },
-      ],
+      messages,
     });
 
     let reply =
       response.content?.[0]?.text || "No recommendation could be generated.";
 
-    // Enrich with LinkedIn data if available
+    // Enrich with portfolio data
     const recommendedNames = extractNamesFromReply(reply);
     if (recommendedNames.length > 0) {
       const enrichment = await enrichRecommendations(recommendedNames, roster);
@@ -394,12 +563,15 @@ slack.event("message", async ({ event, say }) => {
   const query = event.text.trim();
 
   const thinking = await say({
-    text: "🔍 Checking the freelancer roster...",
+    text: "🔍 Checking the team and freelancer roster...",
   });
 
   try {
-    const roster = await fetchRoster();
+    // Fetch latest data from both sheets
+    const [roster, team] = await Promise.all([fetchRoster(), fetchTeam()]);
     const rosterText = formatRosterForPrompt(roster);
+    const teamText = formatTeamForPrompt(team);
+    const allData = teamText + "\n" + rosterText;
 
     const response = await anthropic.messages.create({
       model: "claude-sonnet-4-20250514",
@@ -408,7 +580,7 @@ slack.event("message", async ({ event, say }) => {
       messages: [
         {
           role: "user",
-          content: `Here is the current freelancer roster:\n${rosterText}\n\n---\n\nRequest: ${query}`,
+          content: `Here is the internal team and freelancer roster:\n${allData}\n\n---\n\nRequest: ${query}`,
         },
       ],
     });
@@ -416,7 +588,7 @@ slack.event("message", async ({ event, say }) => {
     let reply =
       response.content?.[0]?.text || "No recommendation could be generated.";
 
-    // Enrich with LinkedIn data if available
+    // Enrich with portfolio data
     const recommendedNames = extractNamesFromReply(reply);
     if (recommendedNames.length > 0) {
       const enrichment = await enrichRecommendations(recommendedNames, roster);
@@ -445,4 +617,9 @@ slack.event("message", async ({ event, say }) => {
   console.log("⚡ Freelancer Finder bot is running!");
   console.log("📊 Connected to freelancer spreadsheet");
   console.log(`📂 Tabs: ${FREELANCER_TABS.join(", ")}`);
+  if (TEAM_SPREADSHEET_ID) {
+    console.log("👥 Internal team sheet connected");
+  } else {
+    console.log("ℹ️  No internal team sheet configured (set GOOGLE_TEAM_SPREADSHEET_ID to enable)");
+  }
 })();
