@@ -30,6 +30,8 @@ const sheets = google.sheets({
 
 const SPREADSHEET_ID = process.env.GOOGLE_SPREADSHEET_ID;
 const TEAM_SPREADSHEET_ID = process.env.GOOGLE_TEAM_SPREADSHEET_ID || null;
+const SUBMISSIONS_SPREADSHEET_ID = process.env.GOOGLE_SUBMISSIONS_SPREADSHEET_ID || null;
+const SUBMISSIONS_NOTIFY_CHANNEL = process.env.SUBMISSIONS_NOTIFY_CHANNEL || null;
 
 // ── Tabs we care about (skip "REQUESTS" tab) ────────────────────────
 
@@ -610,6 +612,90 @@ slack.event("message", async ({ event, say }) => {
   }
 });
 
+// ── Google Form submission watcher ────────────────────────────────────
+
+let lastKnownSubmissionCount = null;
+const SUBMISSION_POLL_INTERVAL_MS = 5 * 60 * 1000; // Check every 5 minutes
+
+async function checkForNewSubmissions() {
+  if (!SUBMISSIONS_SPREADSHEET_ID || !SUBMISSIONS_NOTIFY_CHANNEL) return;
+
+  try {
+    const { data } = await sheets.spreadsheets.values.get({
+      spreadsheetId: SUBMISSIONS_SPREADSHEET_ID,
+      range: "'Form Responses 1'!A1:Z",
+    });
+
+    const rows = data.values || [];
+    if (rows.length < 2) return; // No data yet (just headers)
+
+    const headers = rows[0].map((h) => h.trim());
+    const currentCount = rows.length - 1; // Exclude header row
+
+    // First run — just record the count, don't spam old submissions
+    if (lastKnownSubmissionCount === null) {
+      lastKnownSubmissionCount = currentCount;
+      console.log(`📝 Submissions watcher started — ${currentCount} existing submissions`);
+      return;
+    }
+
+    // No new submissions
+    if (currentCount <= lastKnownSubmissionCount) return;
+
+    // Process new submissions (could be more than one if multiple came in between polls)
+    const newRows = rows.slice(lastKnownSubmissionCount + 1);
+    console.log(`📝 ${newRows.length} new freelancer submission(s) detected!`);
+
+    for (const row of newRows) {
+      const entry = {};
+      headers.forEach((header, col) => {
+        entry[header] = (row[col] || "").trim();
+      });
+
+      // Build a Slack notification
+      const name = entry["Full Name"] || entry["Name"] || "Unknown";
+      const email = entry["Email Address"] || entry["Email"] || "";
+      const category = entry["Primary Discipline"] || entry["Category"] || "";
+      const level = entry["Experience Level"] || entry["Level"] || "";
+      const rate = entry["Day Rate (per 8hr day)"] || entry["Rate"] || "";
+      const capabilities = entry["Key Skills & Capabilities"] || entry["Capabilities"] || "";
+      const portfolio = entry["Portfolio URL"] || entry["Portfolio"] || "";
+      const linkedin = entry["LinkedIn URL"] || entry["LinkedIn"] || "";
+      const location = entry["Location (City, Country)"] || entry["Location"] || "";
+      const about = entry["Tell us about yourself"] || entry["About"] || "";
+
+      let message = `📬 *New Freelancer Application*\n\n`;
+      message += `*${name}*`;
+      if (category) message += ` — ${category}`;
+      if (level) message += ` | ${level}`;
+      if (rate) message += ` | ${rate}/day`;
+      message += `\n`;
+      if (location) message += `📍 ${location}\n`;
+      if (capabilities) message += `🛠️ ${capabilities}\n`;
+      if (about) message += `💬 _"${about.length > 200 ? about.substring(0, 200) + "..." : about}"_\n`;
+      message += `\n`;
+      if (portfolio) message += `🔗 <${portfolio.startsWith("http") ? portfolio : "https://" + portfolio}|Portfolio>`;
+      if (linkedin) message += `${portfolio ? "  •  " : ""}🔗 <${linkedin.startsWith("http") ? linkedin : "https://" + linkedin}|LinkedIn>`;
+      if (email) message += `${portfolio || linkedin ? "  •  " : ""}📧 ${email}`;
+      message += `\n\n_React with ✅ to add to the roster, or ❌ to pass._`;
+
+      await slack.client.chat.postMessage({
+        channel: SUBMISSIONS_NOTIFY_CHANNEL,
+        text: message,
+      });
+    }
+
+    lastKnownSubmissionCount = currentCount;
+  } catch (err) {
+    // Don't crash the bot if submissions sheet isn't set up yet
+    if (err.message?.includes("Unable to parse range")) {
+      // Sheet tab doesn't exist yet — form hasn't received any responses
+      return;
+    }
+    console.warn("⚠️ Submission watcher error:", err.message);
+  }
+}
+
 // ── Start the bot ────────────────────────────────────────────────────
 
 (async () => {
@@ -621,5 +707,14 @@ slack.event("message", async ({ event, say }) => {
     console.log("👥 Internal team sheet connected");
   } else {
     console.log("ℹ️  No internal team sheet configured (set GOOGLE_TEAM_SPREADSHEET_ID to enable)");
+  }
+  if (SUBMISSIONS_SPREADSHEET_ID && SUBMISSIONS_NOTIFY_CHANNEL) {
+    console.log("📝 Submission watcher active — checking every 5 minutes");
+    // Initial check
+    await checkForNewSubmissions();
+    // Then poll on interval
+    setInterval(checkForNewSubmissions, SUBMISSION_POLL_INTERVAL_MS);
+  } else {
+    console.log("ℹ️  Submission watcher not configured (set GOOGLE_SUBMISSIONS_SPREADSHEET_ID and SUBMISSIONS_NOTIFY_CHANNEL to enable)");
   }
 })();
