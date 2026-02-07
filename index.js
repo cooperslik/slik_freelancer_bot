@@ -1527,25 +1527,32 @@ slack.event("app_mention", async ({ event, say }) => {
 
           try {
             if (blocks) {
-              console.log(`📸 Sending chat.update with ${blocks.length} blocks to channel=${event.channel} ts=${thinking.ts}`);
+              const blocksJson = JSON.stringify(blocks);
+              console.log(`📸 Sending chat.update with ${blocks.length} blocks (${blocksJson.length} bytes) to channel=${event.channel} ts=${thinking.ts}`);
               const updateResult = await slack.client.chat.update({
                 channel: event.channel,
                 ts: thinking.ts,
                 text: reply + enrichment.text,
-                blocks,
+                blocks: blocks,
               });
-              console.log(`📸 chat.update with blocks succeeded! ok=${updateResult.ok}`);
+              console.log(`📸 ✅ chat.update with blocks SUCCEEDED! ok=${updateResult.ok} ts=${updateResult.ts}`);
             } else if (enrichment.text) {
               await slack.client.chat.update({
                 channel: event.channel,
                 ts: thinking.ts,
                 text: reply + enrichment.text,
               });
+              console.log("📸 ✅ chat.update with text-only enrichment succeeded");
             }
           } catch (blockError) {
             // If blocks fail, just append portfolio text
-            console.warn("⚠️ Block update failed:", blockError.message);
-            console.warn("⚠️ Block error details:", JSON.stringify(blockError.data || blockError, null, 2));
+            console.error("📸 ❌ BLOCK UPDATE FAILED:", blockError.message);
+            try {
+              console.error("📸 ❌ Error code:", blockError.code);
+              console.error("📸 ❌ Error data:", JSON.stringify(blockError.data, null, 2));
+            } catch (e) {
+              console.error("📸 ❌ Full error:", String(blockError));
+            }
             if (enrichment.text) {
               await slack.client.chat.update({
                 channel: event.channel,
@@ -1555,7 +1562,7 @@ slack.event("app_mention", async ({ event, say }) => {
             }
           }
         } catch (enrichError) {
-          console.warn("⚠️ Portfolio enrichment failed:", enrichError.message);
+          console.error("📸 ❌ ENRICHMENT FAILED:", enrichError.message);
         }
       })();
     }
@@ -1643,24 +1650,31 @@ slack.event("message", async ({ event, say }) => {
 
           try {
             if (blocks) {
-              console.log(`📸 [DM] Sending chat.update with ${blocks.length} blocks`);
+              const blocksJson = JSON.stringify(blocks);
+              console.log(`📸 [DM] Sending chat.update with ${blocks.length} blocks (${blocksJson.length} bytes)`);
               const updateResult = await slack.client.chat.update({
                 channel: event.channel,
                 ts: thinking.ts,
                 text: reply + enrichment.text,
-                blocks,
+                blocks: blocks,
               });
-              console.log(`📸 [DM] chat.update with blocks succeeded! ok=${updateResult.ok}`);
+              console.log(`📸 [DM] ✅ chat.update with blocks SUCCEEDED! ok=${updateResult.ok} ts=${updateResult.ts}`);
             } else if (enrichment.text) {
               await slack.client.chat.update({
                 channel: event.channel,
                 ts: thinking.ts,
                 text: reply + enrichment.text,
               });
+              console.log("📸 [DM] ✅ chat.update with text-only enrichment succeeded");
             }
           } catch (blockError) {
-            console.warn("⚠️ [DM] Block update failed:", blockError.message);
-            console.warn("⚠️ [DM] Block error details:", JSON.stringify(blockError.data || blockError, null, 2));
+            console.error("📸 [DM] ❌ BLOCK UPDATE FAILED:", blockError.message);
+            try {
+              console.error("📸 [DM] ❌ Error code:", blockError.code);
+              console.error("📸 [DM] ❌ Error data:", JSON.stringify(blockError.data, null, 2));
+            } catch (e) {
+              console.error("📸 [DM] ❌ Full error:", String(blockError));
+            }
             if (enrichment.text) {
               await slack.client.chat.update({
                 channel: event.channel,
@@ -1670,7 +1684,7 @@ slack.event("message", async ({ event, say }) => {
             }
           }
         } catch (enrichError) {
-          console.warn("⚠️ Portfolio enrichment failed:", enrichError.message);
+          console.error("📸 [DM] ❌ ENRICHMENT FAILED:", enrichError.message);
         }
       })();
     }
