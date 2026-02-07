@@ -1117,10 +1117,19 @@ slack.action("approve_submission", async ({ body, ack }) => {
     pendingSubmissions.delete(messageTs);
   } catch (error) {
     console.error(`❌ Failed to add "${submission.name}" to roster:`, error.message);
+
+    let errorMsg = `⚠️ Couldn't add *${submission.name}* to the roster.`;
+    if (error.message?.includes("Unable to parse range")) {
+      const tabName = resolveTab(submission.category);
+      errorMsg += `\n\nThe *${tabName}* tab doesn't exist in the Google Sheet. Create it with the same headers as your other tabs (title in row 1, headers in row 2), then try the button again.`;
+    } else {
+      errorMsg += ` Error: ${error.message}`;
+    }
+
     await slack.client.chat.postMessage({
       channel,
       thread_ts: messageTs,
-      text: `⚠️ Couldn't add *${submission.name}* to the roster: ${error.message}`,
+      text: errorMsg,
     });
   }
 });
@@ -1158,11 +1167,58 @@ slack.action("reject_submission", async ({ body, ack }) => {
 
 // ── Start the bot ────────────────────────────────────────────────────
 
+// ── Auto-detect actual tab names from the spreadsheet ─────────────────
+
+async function syncTabNames() {
+  try {
+    const { data } = await sheets.spreadsheets.get({
+      spreadsheetId: SPREADSHEET_ID,
+      fields: "sheets.properties.title",
+    });
+
+    const actualTabs = data.sheets.map((s) => s.properties.title);
+    console.log(`📂 Actual tabs in sheet: [${actualTabs.join(", ")}]`);
+
+    // Check each expected tab and fix the name if there's a close match
+    for (let i = 0; i < FREELANCER_TABS.length; i++) {
+      const expected = FREELANCER_TABS[i];
+      if (actualTabs.includes(expected)) continue; // Exact match — good
+
+      // Try to find a close match (case-insensitive, trimmed)
+      const match = actualTabs.find(
+        (t) => t.trim().toLowerCase() === expected.trim().toLowerCase()
+      );
+      if (match) {
+        console.log(`🔧 Tab name fix: "${expected}" → "${match}"`);
+        FREELANCER_TABS[i] = match;
+      } else {
+        console.warn(`⚠️ Tab "${expected}" not found in spreadsheet — will be skipped`);
+      }
+    }
+
+    // Also update the CATEGORY_TO_TAB mapping with corrected names
+    for (const [key, val] of Object.entries(CATEGORY_TO_TAB)) {
+      if (!actualTabs.includes(val)) {
+        const match = actualTabs.find(
+          (t) => t.trim().toLowerCase() === val.trim().toLowerCase()
+        );
+        if (match) CATEGORY_TO_TAB[key] = match;
+      }
+    }
+  } catch (err) {
+    console.warn("⚠️ Could not sync tab names:", err.message);
+  }
+}
+
 (async () => {
   await slack.start(process.env.PORT || 3000);
   console.log("⚡ Freelancer Finder bot is running!");
   console.log("📊 Connected to freelancer spreadsheet");
-  console.log(`📂 Tabs: ${FREELANCER_TABS.join(", ")}`);
+
+  // Auto-detect actual tab names to fix any mismatches
+  await syncTabNames();
+  console.log(`📂 Using tabs: ${FREELANCER_TABS.join(", ")}`);
+
   if (TEAM_SPREADSHEET_ID) {
     console.log("👥 Internal team sheet connected");
   } else {
