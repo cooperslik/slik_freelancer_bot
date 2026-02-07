@@ -934,10 +934,14 @@ function resolveTab(category) {
 }
 
 let lastKnownSubmissionCount = null;
+const processedSubmissions = new Set(); // Dedup: track timestamps we've already notified about
+let isCheckingSubmissions = false; // Prevent overlapping polls
 const SUBMISSION_POLL_INTERVAL_MS = 5 * 60 * 1000; // Check every 5 minutes
 
 async function checkForNewSubmissions() {
   if (!SUBMISSIONS_SPREADSHEET_ID || !SUBMISSIONS_NOTIFY_CHANNEL) return;
+  if (isCheckingSubmissions) return; // Already running — skip this cycle
+  isCheckingSubmissions = true;
 
   try {
     const { data } = await sheets.spreadsheets.values.get({
@@ -949,12 +953,20 @@ async function checkForNewSubmissions() {
     if (rows.length < 2) return; // No data yet (just headers)
 
     const headers = rows[0].map((h) => h.trim());
+    const timestampCol = headers.findIndex((h) => h.toLowerCase() === "timestamp");
     const currentCount = rows.length - 1; // Exclude header row
 
-    // First run — just record the count, don't spam old submissions
+    // First run — record the count and mark all existing submissions as processed
     if (lastKnownSubmissionCount === null) {
       lastKnownSubmissionCount = currentCount;
-      console.log(`📝 Submissions watcher started — ${currentCount} existing submissions`);
+      // Pre-populate dedup set with all existing rows so we never re-notify on restart
+      if (timestampCol >= 0) {
+        for (let i = 1; i < rows.length; i++) {
+          const ts = (rows[i][timestampCol] || "").trim();
+          if (ts) processedSubmissions.add(ts);
+        }
+      }
+      console.log(`📝 Submissions watcher started — ${currentCount} existing submissions tracked`);
       return;
     }
 
@@ -966,6 +978,13 @@ async function checkForNewSubmissions() {
     console.log(`📝 ${newRows.length} new freelancer submission(s) detected!`);
 
     for (const row of newRows) {
+      // Dedup check — skip if we've already posted about this submission
+      const rowTimestamp = timestampCol >= 0 ? (row[timestampCol] || "").trim() : "";
+      if (rowTimestamp && processedSubmissions.has(rowTimestamp)) {
+        console.log(`📝 Skipping duplicate submission (timestamp: ${rowTimestamp})`);
+        continue;
+      }
+
       const entry = {};
       headers.forEach((header, col) => {
         entry[header] = (row[col] || "").trim();
@@ -1045,6 +1064,8 @@ async function checkForNewSubmissions() {
 
       if (posted.ts) {
         console.log(`📝 Posted submission for "${name}" (msg ts: ${posted.ts})`);
+        // Mark as processed so overlapping instances (during deploys) won't re-post
+        if (rowTimestamp) processedSubmissions.add(rowTimestamp);
       }
     }
 
@@ -1056,6 +1077,8 @@ async function checkForNewSubmissions() {
       return;
     }
     console.warn("⚠️ Submission watcher error:", err.message);
+  } finally {
+    isCheckingSubmissions = false;
   }
 }
 
