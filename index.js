@@ -793,6 +793,10 @@ async function scrapePortfolio(portfolioUrl) {
       }
     }
     imageUrl = imageUrl.trim() || null;
+    // Slack blocks require HTTPS — upgrade HTTP image URLs
+    if (imageUrl && imageUrl.startsWith("http://")) {
+      imageUrl = imageUrl.replace("http://", "https://");
+    }
     console.log(`📸 ${url}: og:image=${imageUrl || "none"}`);
 
     let pageText = stripHtmlToText(html);
@@ -875,7 +879,11 @@ async function enrichWithPortfolios(names, roster) {
       }
 
       // Use manual photo if provided, otherwise use og:image from scrape
-      const imageUrl = m.manualPhoto || (scrapeResult ? scrapeResult.imageUrl : null);
+      let imageUrl = m.manualPhoto || (scrapeResult ? scrapeResult.imageUrl : null);
+      // Ensure HTTPS for Slack blocks
+      if (imageUrl && imageUrl.startsWith("http://")) {
+        imageUrl = imageUrl.replace("http://", "https://");
+      }
       const summary = scrapeResult ? scrapeResult.summary : null;
 
       if (!imageUrl && !summary) {
