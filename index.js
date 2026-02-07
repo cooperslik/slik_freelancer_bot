@@ -867,9 +867,6 @@ slack.event("message", async ({ event, say }) => {
 
 // ── Google Form submission watcher ────────────────────────────────────
 
-// Store submission data keyed by Slack message ts — so we can look it up when someone reacts
-const pendingSubmissions = new Map();
-
 // Map form "Primary Discipline" values to the actual tab names in the roster sheet
 const CATEGORY_TO_TAB = {
   "creative director": "Creative Directors",
@@ -981,6 +978,19 @@ async function checkForNewSubmissions() {
                 text: { type: "plain_text", text: "✅ Add to Roster" },
                 style: "primary",
                 action_id: "approve_submission",
+                value: JSON.stringify({
+                  name,
+                  email,
+                  category,
+                  level: level.replace(/\s*\(.*?\)\s*/g, "").trim(),
+                  rate,
+                  capabilities,
+                  portfolio,
+                  linkedin,
+                  location,
+                  about: about.length > 300 ? about.substring(0, 300) : about,
+                  clients: entry["Notable Clients or Brands"] || entry["Clients"] || "",
+                }),
               },
               {
                 type: "button",
@@ -993,22 +1003,8 @@ async function checkForNewSubmissions() {
         ],
       });
 
-      // Store the full submission data so we can add them to the roster when someone reacts ✅
       if (posted.ts) {
-        pendingSubmissions.set(posted.ts, {
-          name,
-          email,
-          category,
-          level: level.replace(/\s*\(.*?\)\s*/g, "").trim(), // Strip "(3-5 years)" etc.
-          rate,
-          capabilities,
-          portfolio,
-          linkedin,
-          location,
-          about,
-          clients: entry["Notable Clients or Brands"] || entry["Clients"] || "",
-        });
-        console.log(`📝 Stored submission for "${name}" (msg ts: ${posted.ts})`);
+        console.log(`📝 Posted submission for "${name}" (msg ts: ${posted.ts})`);
       }
     }
 
@@ -1031,14 +1027,21 @@ slack.action("approve_submission", async ({ body, ack }) => {
   const messageTs = body.message.ts;
   const channel = body.channel.id;
   const approvedBy = body.user.name || body.user.id;
-  const submission = pendingSubmissions.get(messageTs);
+
+  // Read submission data from the button value (survives bot restarts)
+  let submission;
+  try {
+    submission = JSON.parse(body.actions[0].value);
+  } catch (e) {
+    submission = null;
+  }
 
   if (!submission) {
-    console.log(`ℹ️ Approve clicked but no pending submission found (msg ts: ${messageTs})`);
+    console.log(`ℹ️ Approve clicked but no submission data in button value (msg ts: ${messageTs})`);
     await slack.client.chat.postMessage({
       channel,
       thread_ts: messageTs,
-      text: "⚠️ This submission has already been processed or the bot was restarted since it was posted. You'll need to add them manually.",
+      text: "⚠️ Couldn't read the submission data. You'll need to add them manually.",
     });
     return;
   }
@@ -1113,8 +1116,6 @@ slack.action("approve_submission", async ({ body, ack }) => {
       text: `✅ ${submission.name} added to ${tabName} by ${approvedBy}`,
     });
 
-    // Remove from pending
-    pendingSubmissions.delete(messageTs);
   } catch (error) {
     console.error(`❌ Failed to add "${submission.name}" to roster:`, error.message);
 
@@ -1140,8 +1141,6 @@ slack.action("reject_submission", async ({ body, ack }) => {
   const messageTs = body.message.ts;
   const channel = body.channel.id;
   const rejectedBy = body.user.name || body.user.id;
-  const submission = pendingSubmissions.get(messageTs);
-  const name = submission?.name || "This applicant";
 
   // Update the original message — replace buttons with "passed" note
   const originalBlocks = body.message.blocks || [];
@@ -1155,14 +1154,10 @@ slack.action("reject_submission", async ({ body, ack }) => {
     channel,
     ts: messageTs,
     blocks: updatedBlocks,
-    text: `❌ ${name} passed by ${rejectedBy}`,
+    text: `❌ Passed by ${rejectedBy}`,
   });
 
-  // Remove from pending
-  if (submission) {
-    pendingSubmissions.delete(messageTs);
-    console.log(`❌ "${name}" rejected by ${rejectedBy}`);
-  }
+  console.log(`❌ Submission rejected by ${rejectedBy}`);
 });
 
 // ── Start the bot ────────────────────────────────────────────────────
