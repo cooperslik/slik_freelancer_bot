@@ -361,8 +361,24 @@ function detectReviewRequest(text) {
   return { name: match[1].trim(), feedback: match[2].trim() };
 }
 
+// Strip accents/diacritics so "Giedrė" matches "Giedre", "José" matches "Jose", etc.
+function normalizeName(str) {
+  return str.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
+}
+
+function namesMatch(sheetName, searchName) {
+  // Exact match (case-insensitive)
+  if (sheetName.toLowerCase().trim() === searchName.toLowerCase().trim()) return true;
+  // Match after stripping accents
+  if (normalizeName(sheetName) === normalizeName(searchName)) return true;
+  return false;
+}
+
 async function findFreelancerInSheet(name) {
-  // Search each tab for the freelancer by name (case-insensitive)
+  console.log(`🔍 Searching for "${name}" across all tabs...`);
+  const matches = [];
+
+  // Search each tab for the freelancer by name — collect ALL matches
   for (const tabName of FREELANCER_TABS) {
     try {
       const { data } = await sheets.spreadsheets.values.get({
@@ -386,21 +402,23 @@ async function findFreelancerInSheet(name) {
       for (let i = 1; i < rows.length; i++) {
         const row = rows[i];
         const cellName = (row[nameCol] || "").trim();
-        if (cellName.toLowerCase() === name.toLowerCase()) {
-          // Found them — row index in sheet is i + 2 (1 for title row, 1 for header row, 0-indexed)
+        if (!cellName) continue;
+
+        if (namesMatch(cellName, name)) {
           const sheetRow = i + 2; // +2 because range starts at A2 (skipping title), and rows[0] = headers
           const currentComments = commentsCol >= 0 ? (row[commentsCol] || "").trim() : "";
-          return {
+          console.log(`✅ Found "${cellName}" in tab "${tabName}" at sheet row ${sheetRow}, comments col ${commentsCol}`);
+          matches.push({
             name: cellName,
             tab: tabName,
             sheetRow,
             commentsCol: commentsCol >= 0 ? commentsCol : null,
             currentComments,
-          };
+          });
         }
       }
     } catch (err) {
-      // Skip tabs that can't be read
+      console.warn(`⚠️ Review search: skipping tab "${tabName}" — ${err.message}`);
     }
   }
 
@@ -413,34 +431,43 @@ async function findFreelancerInSheet(name) {
       });
 
       const rows = data.values || [];
-      if (rows.length < 2) return null;
+      if (rows.length >= 2) {
+        const headers = rows[0].map((h) => h.trim());
+        const commentsCol = headers.findIndex((h) => h.toLowerCase() === "comments");
+        const nameCol = headers.findIndex((h) => h.toLowerCase() === "name");
 
-      const headers = rows[0].map((h) => h.trim());
-      const commentsCol = headers.findIndex((h) => h.toLowerCase() === "comments");
-      const nameCol = headers.findIndex((h) => h.toLowerCase() === "name");
+        if (nameCol >= 0) {
+          for (let i = 1; i < rows.length; i++) {
+            const row = rows[i];
+            const cellName = (row[nameCol] || "").trim();
+            if (!cellName) continue;
 
-      if (nameCol === -1) return null;
-
-      for (let i = 1; i < rows.length; i++) {
-        const row = rows[i];
-        const cellName = (row[nameCol] || "").trim();
-        if (cellName.toLowerCase() === name.toLowerCase()) {
-          return {
-            name: cellName,
-            tab: "Internal Team",
-            sheetRow: i + 1, // Headers in row 1, data from row 2
-            commentsCol: commentsCol >= 0 ? commentsCol : null,
-            currentComments: commentsCol >= 0 ? (row[commentsCol] || "").trim() : "",
-            isTeam: true,
-          };
+            if (namesMatch(cellName, name)) {
+              console.log(`✅ Found "${cellName}" in internal team sheet at row ${i + 1}, comments col ${commentsCol}`);
+              matches.push({
+                name: cellName,
+                tab: "Internal Team",
+                sheetRow: i + 1, // Headers in row 1, data from row 2
+                commentsCol: commentsCol >= 0 ? commentsCol : null,
+                currentComments: commentsCol >= 0 ? (row[commentsCol] || "").trim() : "",
+                isTeam: true,
+              });
+            }
+          }
         }
       }
     } catch (err) {
-      // Skip if team sheet can't be read
+      console.warn(`⚠️ Review search: team sheet error — ${err.message}`);
     }
   }
 
-  return null;
+  if (matches.length === 0) {
+    console.log(`❌ "${name}" not found in any tab or team sheet`);
+  } else {
+    console.log(`📝 Found "${name}" in ${matches.length} location(s): ${matches.map((m) => m.tab).join(", ")}`);
+  }
+
+  return matches;
 }
 
 function colIndexToLetter(index) {
@@ -474,8 +501,12 @@ async function writeFeedback(freelancer, feedback) {
     ? `${colLetter}${freelancer.sheetRow}`
     : `'${freelancer.tab}'!${colLetter}${freelancer.sheetRow}`;
 
+  console.log(`📝 Writing feedback to spreadsheet: ${spreadsheetId}`);
+  console.log(`📝 Range: ${range}`);
+  console.log(`📝 Content: ${updatedComments.substring(0, 100)}...`);
+
   try {
-    await sheets.spreadsheets.values.update({
+    const result = await sheets.spreadsheets.values.update({
       spreadsheetId,
       range,
       valueInputOption: "RAW",
@@ -483,6 +514,8 @@ async function writeFeedback(freelancer, feedback) {
         values: [[updatedComments]],
       },
     });
+
+    console.log(`📝 Write result: ${result.data.updatedCells} cell(s) updated at ${result.data.updatedRange}`);
 
     // Bust the cache so the next recommendation picks up the new feedback
     if (freelancer.isTeam) {
@@ -510,37 +543,45 @@ async function handleReview(query, say, threadTs, channel) {
   });
 
   try {
-    const freelancer = await findFreelancerInSheet(review.name);
+    const matches = await findFreelancerInSheet(review.name);
 
-    if (!freelancer) {
+    if (matches.length === 0) {
       await slack.client.chat.update({
         channel,
         ts: thinking.ts,
-        text: `❌ Couldn't find *${review.name}* in the roster or internal team sheet. Check the spelling and try again — the name needs to match exactly as it appears in the Google Sheet.`,
+        text: `❌ Couldn't find *${review.name}* in the roster or internal team sheet. Check the spelling and try again — the name needs to match how it appears in the Google Sheet.`,
       });
       return true;
     }
 
-    const result = await writeFeedback(freelancer, review.feedback);
+    // Write feedback to ALL tabs where this person appears
+    const results = [];
+    for (const match of matches) {
+      const result = await writeFeedback(match, review.feedback);
+      results.push({ tab: match.tab, ...result });
+    }
 
-    if (result.success) {
-      const source = freelancer.isTeam ? "internal team sheet" : `*${freelancer.tab}* tab`;
+    const succeeded = results.filter((r) => r.success);
+    const failed = results.filter((r) => !r.success);
+    const displayName = matches[0].name;
+
+    if (succeeded.length > 0) {
+      const tabs = succeeded.map((r) => `*${r.tab}*`).join(", ");
+      let message = `✅ Feedback logged for *${displayName}* across ${succeeded.length} tab${succeeded.length > 1 ? "s" : ""}: ${tabs}\n\n> _${review.feedback}_\n\nThis will be factored into future recommendations.`;
+      if (failed.length > 0) {
+        const failedTabs = failed.map((r) => `${r.tab} (${r.reason})`).join(", ");
+        message += `\n\n⚠️ Couldn't update: ${failedTabs}`;
+      }
       await slack.client.chat.update({
         channel,
         ts: thinking.ts,
-        text: `✅ Feedback logged for *${freelancer.name}* in the ${source}.\n\n> _${review.feedback}_\n\nThis will be factored into future recommendations.`,
-      });
-    } else if (result.reason === "no_comments_column") {
-      await slack.client.chat.update({
-        channel,
-        ts: thinking.ts,
-        text: `⚠️ Found *${freelancer.name}* but the ${freelancer.tab} tab doesn't have a Comments column. Add one to the sheet and try again.`,
+        text: message,
       });
     } else {
       await slack.client.chat.update({
         channel,
         ts: thinking.ts,
-        text: `⚠️ Found *${freelancer.name}* but couldn't write to the sheet: ${result.reason}`,
+        text: `⚠️ Found *${displayName}* but couldn't write to any tabs: ${failed.map((r) => `${r.tab} (${r.reason})`).join(", ")}`,
       });
     }
   } catch (error) {
