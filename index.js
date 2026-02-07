@@ -35,6 +35,24 @@ const SUBMISSIONS_NOTIFY_CHANNEL = process.env.SUBMISSIONS_NOTIFY_CHANNEL || nul
 const STREAMTIME_API_KEY = process.env.STREAMTIME_API_KEY || null;
 const STREAMTIME_API_BASE = "https://api.streamtime.net/v1";
 
+// ── Claude API with retry on rate limit ─────────────────────────────
+
+async function claudeCreate(params, retries = 2) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await anthropic.messages.create(params);
+    } catch (err) {
+      if (err.status === 429 && attempt < retries) {
+        const waitSecs = parseInt(err.headers?.["retry-after"] || "30", 10);
+        console.log(`⏳ Rate limited — waiting ${waitSecs}s before retry (attempt ${attempt + 1}/${retries})...`);
+        await new Promise((r) => setTimeout(r, waitSecs * 1000));
+      } else {
+        throw err;
+      }
+    }
+  }
+}
+
 // ── Tabs we care about (skip "REQUESTS" tab) ────────────────────────
 
 const FREELANCER_TABS = [
@@ -200,32 +218,42 @@ async function fetchStreamtimeJobHistory() {
 }
 
 // ── Format Streamtime job history for Claude prompt ──────────────────
+// Only includes people who are in the roster or team sheet to keep the prompt small.
 
-function formatStreamtimeForPrompt(streamtimeData) {
+function formatStreamtimeForPrompt(streamtimeData, roster, team) {
   if (!streamtimeData || !streamtimeData.personJobs) return "";
 
   const { personJobs } = streamtimeData;
   if (Object.keys(personJobs).length === 0) return "";
 
-  let text = "\n\n═══ STREAMTIME JOB HISTORY ═══\n";
-  text += "(Real project data from the agency's project management system — use this to identify who has worked on similar jobs, with the same clients, or on related campaigns. Reference specific job numbers when recommending.)\n";
-
-  for (const [key, person] of Object.entries(personJobs)) {
-    // Only include people with recent-ish jobs (last 50 jobs to keep prompt reasonable)
-    const recentJobs = person.jobs.slice(-50);
-    if (recentJobs.length === 0) continue;
-
-    text += `\n• ${person.fullName}`;
-    if (person.role) text += ` (${person.role})`;
-    text += `\n  Jobs (${recentJobs.length}):`;
-
-    for (const j of recentJobs) {
-      text += `\n    - ${j.number}: ${j.name} [${j.company}]`;
-      if (j.status) text += ` (${j.status})`;
-    }
-    text += "\n";
+  // Build a set of names from the roster + team so we only include relevant people
+  const knownNames = new Set();
+  for (const p of (roster || [])) {
+    if (p.Name) knownNames.add(normalizeName(p.Name));
+  }
+  for (const p of (team || [])) {
+    if (p.Name) knownNames.add(normalizeName(p.Name));
   }
 
+  let text = "\n\n═══ STREAMTIME JOB HISTORY ═══\n";
+  text += "(Real project data — use to match people to similar jobs/clients. Reference job numbers when recommending.)\n";
+
+  let includedCount = 0;
+  for (const [key, person] of Object.entries(personJobs)) {
+    // Only include people who are in our roster or team sheet
+    if (!knownNames.has(normalizeName(person.fullName))) continue;
+
+    // Last 10 jobs per person — enough context without bloating the prompt
+    const recentJobs = person.jobs.slice(-10);
+    if (recentJobs.length === 0) continue;
+
+    text += `\n• ${person.fullName}: `;
+    text += recentJobs.map((j) => `${j.number} ${j.name} [${j.company}]`).join(" | ");
+    text += "\n";
+    includedCount++;
+  }
+
+  if (includedCount === 0) return "";
   return text;
 }
 
@@ -439,7 +467,7 @@ async function scrapePortfolio(portfolioUrl) {
     if (pageText.length < 50) return null; // Too little content to summarise
 
     // Use Claude to extract a short insight from the portfolio
-    const summaryResponse = await anthropic.messages.create({
+    const summaryResponse = await claudeCreate({
       model: "claude-haiku-4-5-20251001",
       max_tokens: 150,
       system:
@@ -896,7 +924,7 @@ slack.event("app_mention", async ({ event, say }) => {
     ]);
     const rosterText = formatRosterForPrompt(roster);
     const teamText = formatTeamForPrompt(team);
-    const streamtimeText = formatStreamtimeForPrompt(streamtime);
+    const streamtimeText = formatStreamtimeForPrompt(streamtime, roster, team);
     const allData = teamText + "\n" + rosterText + streamtimeText;
 
     // Check if this is a follow-up in an existing thread
@@ -948,7 +976,7 @@ slack.event("app_mention", async ({ event, say }) => {
     }
 
     // Ask Claude
-    const response = await anthropic.messages.create({
+    const response = await claudeCreate({
       model: "claude-sonnet-4-20250514",
       max_tokens: 1024,
       system: SYSTEM_PROMPT,
@@ -1008,10 +1036,10 @@ slack.event("message", async ({ event, say }) => {
     ]);
     const rosterText = formatRosterForPrompt(roster);
     const teamText = formatTeamForPrompt(team);
-    const streamtimeText = formatStreamtimeForPrompt(streamtime);
+    const streamtimeText = formatStreamtimeForPrompt(streamtime, roster, team);
     const allData = teamText + "\n" + rosterText + streamtimeText;
 
-    const response = await anthropic.messages.create({
+    const response = await claudeCreate({
       model: "claude-sonnet-4-20250514",
       max_tokens: 1024,
       system: SYSTEM_PROMPT,
