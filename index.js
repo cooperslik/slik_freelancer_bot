@@ -869,20 +869,60 @@ slack.event("message", async ({ event, say }) => {
 
 // Map form "Primary Discipline" values to the actual tab names in the roster sheet
 const CATEGORY_TO_TAB = {
+  // Creative Directors
   "creative director": "Creative Directors",
+  "cd": "Creative Directors",
+  "ecd": "Creative Directors",
+  // AD/Designers
   "ad/designer": "AD/Designers",
   "designer": "AD/Designers",
+  "art director": "AD/Designers",
+  "graphic designer": "AD/Designers",
+  "ui designer": "AD/Designers",
+  "ux designer": "AD/Designers",
+  "ui/ux designer": "AD/Designers",
+  "brand designer": "AD/Designers",
+  "visual designer": "AD/Designers",
+  // Copywriters
   "copywriter": "Copywriters",
+  "writer": "Copywriters",
+  "content writer": "Copywriters",
+  // Animators
   "animator": "Animators",
+  "motion designer": "Animators",
+  "motion graphics": "Animators",
+  "motion": "Animators",
+  "2d animator": "Animators",
+  // 3D Artists
   "3d artist": "3D Artists",
+  "3d animator": "3D Artists",
+  "3d designer": "3D Artists",
+  "cgi artist": "3D Artists",
+  // Developers
   "developer": "Developers",
+  "web developer": "Developers",
+  "frontend developer": "Developers",
+  "backend developer": "Developers",
+  "fullstack developer": "Developers",
+  // Producers/AM
   "producer/am": "Producers/AM",
   "producer": "Producers/AM",
+  "account manager": "Producers/AM",
+  "project manager": "Producers/AM",
+  // Retouchers
   "retoucher": "Retouchers",
+  "photo retoucher": "Retouchers",
+  // Photographer/Videographers
   "photographer/videographer": "Photographer/Videographers",
   "photographer": "Photographer/Videographers",
   "videographer": "Photographer/Videographers",
+  "dop": "Photographer/Videographers",
+  "cinematographer": "Photographer/Videographers",
+  // Strategists
   "strategist": "Strategists",
+  "strategy": "Strategists",
+  "brand strategist": "Strategists",
+  // Specialists
   "specialist": "Specialists",
   "other": "Specialists",
 };
