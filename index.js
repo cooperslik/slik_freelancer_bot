@@ -32,6 +32,8 @@ const SPREADSHEET_ID = process.env.GOOGLE_SPREADSHEET_ID;
 const TEAM_SPREADSHEET_ID = process.env.GOOGLE_TEAM_SPREADSHEET_ID || null;
 const SUBMISSIONS_SPREADSHEET_ID = process.env.GOOGLE_SUBMISSIONS_SPREADSHEET_ID || null;
 const SUBMISSIONS_NOTIFY_CHANNEL = process.env.SUBMISSIONS_NOTIFY_CHANNEL || null;
+const STREAMTIME_API_KEY = process.env.STREAMTIME_API_KEY || null;
+const STREAMTIME_API_BASE = "https://api.streamtime.net/v1";
 
 // ── Tabs we care about (skip "REQUESTS" tab) ────────────────────────
 
@@ -56,6 +58,176 @@ let cacheTimestamp = 0;
 let teamCache = null;
 let teamCacheTimestamp = 0;
 const CACHE_TTL_MS = 60 * 1000; // 1 minute — fresh enough for live data, avoids hammering the API
+
+// ── Streamtime job history cache ────────────────────────────────────
+let streamtimeCache = null;
+let streamtimeCacheTimestamp = 0;
+const STREAMTIME_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes — jobs don't change as often
+
+// ── Streamtime API helper ───────────────────────────────────────────
+
+async function streamtimeFetch(path, method = "GET", body = null) {
+  if (!STREAMTIME_API_KEY) return null;
+
+  const options = {
+    method,
+    headers: {
+      Authorization: `Bearer ${STREAMTIME_API_KEY}`,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+  };
+  if (body) options.body = JSON.stringify(body);
+
+  const res = await fetch(`${STREAMTIME_API_BASE}${path}`, options);
+  if (!res.ok) return null;
+  return res.json();
+}
+
+async function streamtimeSearch(searchView, maxResults = 200, offset = 0) {
+  return streamtimeFetch(
+    `/search?search_view=${searchView}&include_statistics=false`,
+    "POST",
+    {
+      offset,
+      maxResults,
+      filterGroupCollection: {
+        conditionMatchTypeId: 1,
+        filterGroups: [],
+        filterGroupCollections: [],
+      },
+    }
+  );
+}
+
+// ── Fetch Streamtime job history and build person → jobs mapping ─────
+
+async function fetchStreamtimeJobHistory() {
+  if (!STREAMTIME_API_KEY) return null;
+
+  // Return cached data if still fresh
+  if (streamtimeCache && Date.now() - streamtimeCacheTimestamp < STREAMTIME_CACHE_TTL_MS) {
+    return streamtimeCache;
+  }
+
+  try {
+    console.log("🏢 Fetching Streamtime job history...");
+
+    // 1. Fetch all users to get ID → name mapping
+    const usersData = await streamtimeFetch("/users");
+    if (!usersData) {
+      console.warn("⚠️ Streamtime: could not fetch users");
+      return null;
+    }
+
+    const userMap = {}; // id → { firstName, lastName, fullName, role }
+    for (const u of usersData) {
+      userMap[u.id] = {
+        firstName: u.firstName || "",
+        lastName: u.lastName || "",
+        fullName: `${u.firstName || ""} ${u.lastName || ""}`.trim(),
+        displayName: u.displayName || "",
+        role: u.role?.name || u.jobTitle || "",
+      };
+    }
+    console.log(`🏢 Streamtime: ${Object.keys(userMap).length} users loaded`);
+
+    // 2. Fetch all jobs (paginated — get up to 1000)
+    const allJobs = [];
+    let offset = 0;
+    const pageSize = 200;
+
+    while (true) {
+      const jobData = await streamtimeSearch(7, pageSize, offset);
+      if (!jobData || !jobData.searchResults) break;
+
+      allJobs.push(...jobData.searchResults);
+
+      if (jobData.searchResults.length < pageSize) break; // Last page
+      offset += pageSize;
+
+      // Safety limit — don't fetch forever
+      if (allJobs.length >= 2000) break;
+    }
+
+    console.log(`🏢 Streamtime: ${allJobs.length} jobs loaded`);
+
+    // 3. Build person → jobs mapping
+    // Maps a person's full name (lowercase) to an array of jobs they've worked on
+    const personJobs = {};
+
+    for (const job of allJobs) {
+      const jobInfo = {
+        number: job.number || "",
+        name: job.name || "",
+        fullName: job.fullName || "",
+        company: job.company?.name || "Unknown client",
+        status: job.jobStatus?.name || "",
+        createdDate: job.jobCreatedDate || "",
+        startDate: job.estimatedStartDate || "",
+        endDate: job.estimatedEndDate || "",
+        completedDate: job.completedDate || "",
+      };
+
+      // Each job has a users array with {id, name}
+      const jobUsers = job.users || [];
+      for (const u of jobUsers) {
+        const user = userMap[u.id];
+        if (!user) continue;
+
+        const key = user.fullName.toLowerCase();
+        if (!personJobs[key]) {
+          personJobs[key] = {
+            fullName: user.fullName,
+            displayName: user.displayName,
+            role: user.role,
+            jobs: [],
+          };
+        }
+        personJobs[key].jobs.push(jobInfo);
+      }
+    }
+
+    console.log(`🏢 Streamtime: ${Object.keys(personJobs).length} people matched to jobs`);
+
+    streamtimeCache = { userMap, personJobs, totalJobs: allJobs.length };
+    streamtimeCacheTimestamp = Date.now();
+    return streamtimeCache;
+  } catch (err) {
+    console.warn("⚠️ Streamtime fetch error:", err.message);
+    return null;
+  }
+}
+
+// ── Format Streamtime job history for Claude prompt ──────────────────
+
+function formatStreamtimeForPrompt(streamtimeData) {
+  if (!streamtimeData || !streamtimeData.personJobs) return "";
+
+  const { personJobs } = streamtimeData;
+  if (Object.keys(personJobs).length === 0) return "";
+
+  let text = "\n\n═══ STREAMTIME JOB HISTORY ═══\n";
+  text += "(Real project data from the agency's project management system — use this to identify who has worked on similar jobs, with the same clients, or on related campaigns. Reference specific job numbers when recommending.)\n";
+
+  for (const [key, person] of Object.entries(personJobs)) {
+    // Only include people with recent-ish jobs (last 50 jobs to keep prompt reasonable)
+    const recentJobs = person.jobs.slice(-50);
+    if (recentJobs.length === 0) continue;
+
+    text += `\n• ${person.fullName}`;
+    if (person.role) text += ` (${person.role})`;
+    text += `\n  Jobs (${recentJobs.length}):`;
+
+    for (const j of recentJobs) {
+      text += `\n    - ${j.number}: ${j.name} [${j.company}]`;
+      if (j.status) text += ` (${j.status})`;
+    }
+    text += "\n";
+  }
+
+  return text;
+}
 
 // ── Read entire freelancer roster from Google Sheets ─────────────────
 
@@ -614,6 +786,7 @@ HOW TO EVALUATE CANDIDATES (both internal and freelancers):
 - **Availability & Status**: Strongly prefer people who are marked as available. Flag concerns if recommending someone who may be busy.
 - **Cost Rate (per 8hr day)**: Always show this. If the requester mentions a budget, filter accordingly.
 - **Location**: Only factor this in if the requester mentions on-site, local, or timezone needs.
+- **Streamtime Job History**: If provided, this is REAL project data from the agency's management system. Use it to identify people who have worked on similar projects, with the same client, or in the same industry. When someone has relevant job history, reference the specific job number (e.g. "[WOOL1349]") and suggest the producer talk to them about that project. This is extremely powerful context — a person who worked on a previous Woolworths campaign is a much stronger match for a new Woolworths brief.
 
 RULES:
 1. Always check the internal team first. If a strong internal match exists, lead with them.
@@ -715,11 +888,16 @@ slack.event("app_mention", async ({ event, say }) => {
   });
 
   try {
-    // Fetch latest data from both sheets
-    const [roster, team] = await Promise.all([fetchRoster(), fetchTeam()]);
+    // Fetch latest data from both sheets + Streamtime
+    const [roster, team, streamtime] = await Promise.all([
+      fetchRoster(),
+      fetchTeam(),
+      fetchStreamtimeJobHistory(),
+    ]);
     const rosterText = formatRosterForPrompt(roster);
     const teamText = formatTeamForPrompt(team);
-    const allData = teamText + "\n" + rosterText;
+    const streamtimeText = formatStreamtimeForPrompt(streamtime);
+    const allData = teamText + "\n" + rosterText + streamtimeText;
 
     // Check if this is a follow-up in an existing thread
     const isFollowUp = !!event.thread_ts;
@@ -822,11 +1000,16 @@ slack.event("message", async ({ event, say }) => {
   });
 
   try {
-    // Fetch latest data from both sheets
-    const [roster, team] = await Promise.all([fetchRoster(), fetchTeam()]);
+    // Fetch latest data from both sheets + Streamtime
+    const [roster, team, streamtime] = await Promise.all([
+      fetchRoster(),
+      fetchTeam(),
+      fetchStreamtimeJobHistory(),
+    ]);
     const rosterText = formatRosterForPrompt(roster);
     const teamText = formatTeamForPrompt(team);
-    const allData = teamText + "\n" + rosterText;
+    const streamtimeText = formatStreamtimeForPrompt(streamtime);
+    const allData = teamText + "\n" + rosterText + streamtimeText;
 
     const response = await anthropic.messages.create({
       model: "claude-sonnet-4-20250514",
@@ -1281,6 +1464,16 @@ async function syncTabNames() {
     console.log("👥 Internal team sheet connected");
   } else {
     console.log("ℹ️  No internal team sheet configured (set GOOGLE_TEAM_SPREADSHEET_ID to enable)");
+  }
+  if (STREAMTIME_API_KEY) {
+    const stData = await fetchStreamtimeJobHistory();
+    if (stData) {
+      console.log(`🏢 Streamtime connected — ${stData.totalJobs} jobs, ${Object.keys(stData.personJobs).length} people mapped`);
+    } else {
+      console.log("⚠️ Streamtime API key set but could not fetch data");
+    }
+  } else {
+    console.log("ℹ️  Streamtime not configured (set STREAMTIME_API_KEY to enable job history)");
   }
   if (SUBMISSIONS_SPREADSHEET_ID && SUBMISSIONS_NOTIFY_CHANNEL) {
     console.log("📝 Submission watcher active — checking every 5 minutes");
