@@ -939,9 +939,43 @@ function extractNamesFromReply(reply) {
   return names;
 }
 
-// ── Build Slack blocks with profile images from og:image ──────────────
-// Parses Claude's reply into sections and attaches portfolio images
-// as thumbnails next to each freelancer recommendation.
+// ── Build a simple follow-up message with images + portfolio insights ──
+// Posted as a separate message in the thread after the main recommendation.
+// Uses chat.postMessage (new message) instead of chat.update (which was
+// returning 500 when adding blocks to an existing text message).
+
+function buildFollowUpBlocks(images, portfolioText) {
+  const blocks = [];
+
+  // Add images for each person that has one
+  if (images && Object.keys(images).length > 0) {
+    for (const [name, url] of Object.entries(images)) {
+      blocks.push({
+        type: "section",
+        text: { type: "mrkdwn", text: `📷 *${name}*` },
+        accessory: {
+          type: "image",
+          image_url: url,
+          alt_text: `${name} portfolio image`,
+        },
+      });
+    }
+  }
+
+  // Add portfolio insights text
+  if (portfolioText && portfolioText.trim()) {
+    if (blocks.length > 0) blocks.push({ type: "divider" });
+    blocks.push({
+      type: "section",
+      text: { type: "mrkdwn", text: portfolioText.trim() },
+    });
+  }
+
+  return blocks;
+}
+
+// ── (Legacy) Build Slack blocks with profile images from og:image ─────
+// Kept for reference — chat.update with blocks was returning 500 from Slack.
 
 function buildSlackBlocks(reply, images, portfolioText) {
   if (!images || Object.keys(images).length === 0) {
@@ -1512,54 +1546,26 @@ slack.event("app_mention", async ({ event, say }) => {
           const enrichment = await enrichRecommendations(recommendedNames, roster);
           if (!enrichment.text && Object.keys(enrichment.images).length === 0) return;
 
-          // Try to update the original message with blocks + images
-          const blocks = buildSlackBlocks(reply, enrichment.images, enrichment.text);
+          // Build follow-up blocks with images and portfolio insights
+          const followUpBlocks = buildFollowUpBlocks(enrichment.images, enrichment.text);
 
-          console.log(`📸 Blocks built: ${blocks ? blocks.length + " blocks" : "null (no blocks)"}`);
-          if (blocks) {
-            // Log a summary of the blocks structure
-            const blockSummary = blocks.map((b, i) => {
-              const hasAccessory = b.accessory ? ` + image(${b.accessory.image_url?.substring(0, 60)}...)` : "";
-              return `  [${i}] ${b.type}${hasAccessory}`;
-            }).join("\n");
-            console.log(`📸 Block structure:\n${blockSummary}`);
-          }
-
-          try {
-            if (blocks) {
-              const blocksJson = JSON.stringify(blocks);
-              console.log(`📸 Sending chat.update with ${blocks.length} blocks (${blocksJson.length} bytes) to channel=${event.channel} ts=${thinking.ts}`);
-              const updateResult = await slack.client.chat.update({
-                channel: event.channel,
-                ts: thinking.ts,
-                text: reply + enrichment.text,
-                blocks: blocks,
-              });
-              console.log(`📸 ✅ chat.update with blocks SUCCEEDED! ok=${updateResult.ok} ts=${updateResult.ts}`);
-            } else if (enrichment.text) {
-              await slack.client.chat.update({
-                channel: event.channel,
-                ts: thinking.ts,
-                text: reply + enrichment.text,
-              });
-              console.log("📸 ✅ chat.update with text-only enrichment succeeded");
-            }
-          } catch (blockError) {
-            // If blocks fail, just append portfolio text
-            console.error("📸 ❌ BLOCK UPDATE FAILED:", blockError.message);
-            try {
-              console.error("📸 ❌ Error code:", blockError.code);
-              console.error("📸 ❌ Error data:", JSON.stringify(blockError.data, null, 2));
-            } catch (e) {
-              console.error("📸 ❌ Full error:", String(blockError));
-            }
-            if (enrichment.text) {
-              await slack.client.chat.update({
-                channel: event.channel,
-                ts: thinking.ts,
-                text: reply + enrichment.text,
-              });
-            }
+          if (followUpBlocks.length > 0) {
+            console.log(`📸 Posting follow-up with ${followUpBlocks.length} blocks (${Object.keys(enrichment.images).length} images)`);
+            await slack.client.chat.postMessage({
+              channel: event.channel,
+              thread_ts: threadTs,
+              blocks: followUpBlocks,
+              text: enrichment.text || "Portfolio insights",
+            });
+            console.log("📸 ✅ Follow-up message posted successfully");
+          } else if (enrichment.text) {
+            // Text-only enrichment (no images) — append to original message
+            await slack.client.chat.update({
+              channel: event.channel,
+              ts: thinking.ts,
+              text: reply + enrichment.text,
+            });
+            console.log("📸 ✅ Text-only enrichment appended to original message");
           }
         } catch (enrichError) {
           console.error("📸 ❌ ENRICHMENT FAILED:", enrichError.message);
@@ -1637,51 +1643,25 @@ slack.event("message", async ({ event, say }) => {
           const enrichment = await enrichRecommendations(recommendedNames, roster);
           if (!enrichment.text && Object.keys(enrichment.images).length === 0) return;
 
-          const blocks = buildSlackBlocks(reply, enrichment.images, enrichment.text);
+          // Build follow-up blocks with images and portfolio insights
+          const followUpBlocks = buildFollowUpBlocks(enrichment.images, enrichment.text);
 
-          console.log(`📸 [DM] Blocks built: ${blocks ? blocks.length + " blocks" : "null (no blocks)"}`);
-          if (blocks) {
-            const blockSummary = blocks.map((b, i) => {
-              const hasAccessory = b.accessory ? ` + image(${b.accessory.image_url?.substring(0, 60)}...)` : "";
-              return `  [${i}] ${b.type}${hasAccessory}`;
-            }).join("\n");
-            console.log(`📸 [DM] Block structure:\n${blockSummary}`);
-          }
-
-          try {
-            if (blocks) {
-              const blocksJson = JSON.stringify(blocks);
-              console.log(`📸 [DM] Sending chat.update with ${blocks.length} blocks (${blocksJson.length} bytes)`);
-              const updateResult = await slack.client.chat.update({
-                channel: event.channel,
-                ts: thinking.ts,
-                text: reply + enrichment.text,
-                blocks: blocks,
-              });
-              console.log(`📸 [DM] ✅ chat.update with blocks SUCCEEDED! ok=${updateResult.ok} ts=${updateResult.ts}`);
-            } else if (enrichment.text) {
-              await slack.client.chat.update({
-                channel: event.channel,
-                ts: thinking.ts,
-                text: reply + enrichment.text,
-              });
-              console.log("📸 [DM] ✅ chat.update with text-only enrichment succeeded");
-            }
-          } catch (blockError) {
-            console.error("📸 [DM] ❌ BLOCK UPDATE FAILED:", blockError.message);
-            try {
-              console.error("📸 [DM] ❌ Error code:", blockError.code);
-              console.error("📸 [DM] ❌ Error data:", JSON.stringify(blockError.data, null, 2));
-            } catch (e) {
-              console.error("📸 [DM] ❌ Full error:", String(blockError));
-            }
-            if (enrichment.text) {
-              await slack.client.chat.update({
-                channel: event.channel,
-                ts: thinking.ts,
-                text: reply + enrichment.text,
-              });
-            }
+          if (followUpBlocks.length > 0) {
+            console.log(`📸 [DM] Posting follow-up with ${followUpBlocks.length} blocks (${Object.keys(enrichment.images).length} images)`);
+            await slack.client.chat.postMessage({
+              channel: event.channel,
+              thread_ts: thinking.ts,
+              blocks: followUpBlocks,
+              text: enrichment.text || "Portfolio insights",
+            });
+            console.log("📸 [DM] ✅ Follow-up message posted successfully");
+          } else if (enrichment.text) {
+            await slack.client.chat.update({
+              channel: event.channel,
+              ts: thinking.ts,
+              text: reply + enrichment.text,
+            });
+            console.log("📸 [DM] ✅ Text-only enrichment appended to original message");
           }
         } catch (enrichError) {
           console.error("📸 [DM] ❌ ENRICHMENT FAILED:", enrichError.message);
