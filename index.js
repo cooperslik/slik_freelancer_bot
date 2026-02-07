@@ -1554,32 +1554,34 @@ slack.event("app_mention", async ({ event, say }) => {
       }
     }
 
-    // Single update: thinking message → full response (with or without blocks)
-    try {
-      if (blocks) {
-        await slack.client.chat.update({
+    // Send the response — chat.update with blocks returns 500 on this workspace,
+    // so when we have blocks we post a NEW message and delete the thinking message.
+    if (blocks) {
+      try {
+        await slack.client.chat.postMessage({
           channel: event.channel,
-          ts: thinking.ts,
+          thread_ts: threadTs,
           text: enrichedText,
           blocks,
         });
-        console.log("📸 ✅ Sent response with inline images");
-      } else {
+        // Clean up the thinking message
+        try { await slack.client.chat.delete({ channel: event.channel, ts: thinking.ts }); } catch (e) { /* OK if delete fails */ }
+        console.log("📸 ✅ Sent response with inline images (postMessage)");
+      } catch (postError) {
+        console.error("📸 ❌ Block postMessage failed, falling back to text:", postError.message);
         await slack.client.chat.update({
           channel: event.channel,
           ts: thinking.ts,
           text: enrichedText,
         });
-        console.log("📸 Sent text-only response (no images available)");
       }
-    } catch (updateError) {
-      // If blocks update fails, fall back to text-only
-      console.error("📸 ❌ Block update failed, falling back to text:", updateError.message);
+    } else {
       await slack.client.chat.update({
         channel: event.channel,
         ts: thinking.ts,
         text: enrichedText,
       });
+      console.log("📸 Sent text-only response (no images available)");
     }
   } catch (error) {
     console.error("Error processing request:", error);
@@ -1661,31 +1663,32 @@ slack.event("message", async ({ event, say }) => {
       }
     }
 
-    // Single update: thinking message → full response (with or without blocks)
-    try {
-      if (blocks) {
-        await slack.client.chat.update({
+    // Send the response — use postMessage for blocks (chat.update + blocks = 500)
+    if (blocks) {
+      try {
+        await slack.client.chat.postMessage({
           channel: event.channel,
-          ts: thinking.ts,
+          thread_ts: thinking.ts,
           text: enrichedText,
           blocks,
         });
-        console.log("📸 [DM] ✅ Sent response with inline images");
-      } else {
+        try { await slack.client.chat.delete({ channel: event.channel, ts: thinking.ts }); } catch (e) { /* OK if delete fails */ }
+        console.log("📸 [DM] ✅ Sent response with inline images (postMessage)");
+      } catch (postError) {
+        console.error("📸 [DM] ❌ Block postMessage failed, falling back to text:", postError.message);
         await slack.client.chat.update({
           channel: event.channel,
           ts: thinking.ts,
           text: enrichedText,
         });
-        console.log("📸 [DM] Sent text-only response");
       }
-    } catch (updateError) {
-      console.error("📸 [DM] ❌ Block update failed, falling back to text:", updateError.message);
+    } else {
       await slack.client.chat.update({
         channel: event.channel,
         ts: thinking.ts,
         text: enrichedText,
       });
+      console.log("📸 [DM] Sent text-only response");
     }
   } catch (error) {
     console.error("Error processing DM:", error);
