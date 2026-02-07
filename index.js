@@ -1493,14 +1493,26 @@ slack.event("app_mention", async ({ event, say }) => {
           // Try to update the original message with blocks + images
           const blocks = buildSlackBlocks(reply, enrichment.images, enrichment.text);
 
+          console.log(`📸 Blocks built: ${blocks ? blocks.length + " blocks" : "null (no blocks)"}`);
+          if (blocks) {
+            // Log a summary of the blocks structure
+            const blockSummary = blocks.map((b, i) => {
+              const hasAccessory = b.accessory ? ` + image(${b.accessory.image_url?.substring(0, 60)}...)` : "";
+              return `  [${i}] ${b.type}${hasAccessory}`;
+            }).join("\n");
+            console.log(`📸 Block structure:\n${blockSummary}`);
+          }
+
           try {
             if (blocks) {
-              await slack.client.chat.update({
+              console.log(`📸 Sending chat.update with ${blocks.length} blocks to channel=${event.channel} ts=${thinking.ts}`);
+              const updateResult = await slack.client.chat.update({
                 channel: event.channel,
                 ts: thinking.ts,
                 text: reply + enrichment.text,
                 blocks,
               });
+              console.log(`📸 chat.update with blocks succeeded! ok=${updateResult.ok}`);
             } else if (enrichment.text) {
               await slack.client.chat.update({
                 channel: event.channel,
@@ -1510,7 +1522,8 @@ slack.event("app_mention", async ({ event, say }) => {
             }
           } catch (blockError) {
             // If blocks fail, just append portfolio text
-            console.warn("⚠️ Block update failed, appending text only:", blockError.message);
+            console.warn("⚠️ Block update failed:", blockError.message);
+            console.warn("⚠️ Block error details:", JSON.stringify(blockError.data || blockError, null, 2));
             if (enrichment.text) {
               await slack.client.chat.update({
                 channel: event.channel,
@@ -1596,14 +1609,25 @@ slack.event("message", async ({ event, say }) => {
 
           const blocks = buildSlackBlocks(reply, enrichment.images, enrichment.text);
 
+          console.log(`📸 [DM] Blocks built: ${blocks ? blocks.length + " blocks" : "null (no blocks)"}`);
+          if (blocks) {
+            const blockSummary = blocks.map((b, i) => {
+              const hasAccessory = b.accessory ? ` + image(${b.accessory.image_url?.substring(0, 60)}...)` : "";
+              return `  [${i}] ${b.type}${hasAccessory}`;
+            }).join("\n");
+            console.log(`📸 [DM] Block structure:\n${blockSummary}`);
+          }
+
           try {
             if (blocks) {
-              await slack.client.chat.update({
+              console.log(`📸 [DM] Sending chat.update with ${blocks.length} blocks`);
+              const updateResult = await slack.client.chat.update({
                 channel: event.channel,
                 ts: thinking.ts,
                 text: reply + enrichment.text,
                 blocks,
               });
+              console.log(`📸 [DM] chat.update with blocks succeeded! ok=${updateResult.ok}`);
             } else if (enrichment.text) {
               await slack.client.chat.update({
                 channel: event.channel,
@@ -1612,7 +1636,8 @@ slack.event("message", async ({ event, say }) => {
               });
             }
           } catch (blockError) {
-            console.warn("⚠️ Block update failed, appending text only:", blockError.message);
+            console.warn("⚠️ [DM] Block update failed:", blockError.message);
+            console.warn("⚠️ [DM] Block error details:", JSON.stringify(blockError.data || blockError, null, 2));
             if (enrichment.text) {
               await slack.client.chat.update({
                 channel: event.channel,
