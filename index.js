@@ -853,7 +853,7 @@ async function enrichWithPortfolios(names, roster) {
   const matches = [];
   for (const name of names) {
     const person = roster.find(
-      (p) => p.Name && p.Name.toLowerCase() === name.toLowerCase()
+      (p) => p.Name && normalizeName(p.Name) === normalizeName(name)
     );
     if (person) {
       const portfolioUrl = person.Portfolio || "";
@@ -1005,8 +1005,14 @@ function buildSlackBlocks(reply, images, portfolioText) {
     };
 
     // Attach portfolio image as thumbnail if we have one
+    // Use normalized name matching (handles accents, casing differences between Claude's output and sheet names)
     const name = medals[i].name;
-    const imageUrl = images[name];
+    const normalizedMedalName = normalizeName(name);
+    const imageEntry = Object.entries(images).find(
+      ([k]) => normalizeName(k) === normalizedMedalName
+    );
+    const imageUrl = imageEntry ? imageEntry[1] : null;
+    console.log(`📸 Block match: "${name}" (normalized: "${normalizedMedalName}") → ${imageUrl ? "✅ " + imageUrl : "❌ no match"} | image keys: [${Object.keys(images).map(k => `"${k}"`).join(", ")}]`);
     if (imageUrl) {
       block.accessory = {
         type: "image",
