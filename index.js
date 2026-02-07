@@ -462,17 +462,25 @@ async function syncStreamtimeToTeamSheet() {
       }
     }
 
-    // 4b. Find people in the sheet who are no longer in Streamtime → mark Inactive
+    // 4b. Update Status column for everyone in the sheet
     const markedInactive = [];
+    const markedActive = [];
     if (statusCol >= 0) {
       for (const [normalized, rowIdx] of existingNames) {
-        if (activeStreamtimeNames.has(normalized)) continue; // Still active
-
-        const currentStatus = (rows[rowIdx][statusCol] || "").trim();
-        if (currentStatus.toLowerCase() === "inactive") continue; // Already marked
-
+        const currentStatus = (rows[rowIdx][statusCol] || "").trim().toLowerCase();
         const name = (rows[rowIdx][nameCol] || "").trim();
-        markedInactive.push({ name, rowIdx });
+
+        if (activeStreamtimeNames.has(normalized)) {
+          // Still in Streamtime — mark Active if not already
+          if (currentStatus !== "active") {
+            markedActive.push({ name, rowIdx });
+          }
+        } else {
+          // No longer in Streamtime — mark Inactive if not already
+          if (currentStatus !== "inactive") {
+            markedInactive.push({ name, rowIdx });
+          }
+        }
       }
     }
 
@@ -482,6 +490,7 @@ async function syncStreamtimeToTeamSheet() {
         const row = new Array(headers.length).fill("");
         if (nameCol >= 0) row[nameCol] = u.name;
         if (roleCol >= 0) row[roleCol] = u.role;
+        if (statusCol >= 0) row[statusCol] = "Active";
         return row;
       });
 
@@ -513,29 +522,42 @@ async function syncStreamtimeToTeamSheet() {
       console.log(`🔄 Updated roles for ${updatedRoles.length} team member(s): ${updatedRoles.map((u) => `${u.name} → ${u.role}`).join(", ")}`);
     }
 
-    // 7. Mark departed team members as Inactive
-    for (const departed of markedInactive) {
+    // 7. Update Status column — Active for current, Inactive for departed
+    if (statusCol >= 0) {
       const colLetter = colIndexToLetter(statusCol);
-      const sheetRow = departed.rowIdx + 1;
 
-      await sheets.spreadsheets.values.update({
-        spreadsheetId: TEAM_SPREADSHEET_ID,
-        range: `${colLetter}${sheetRow}`,
-        valueInputOption: "RAW",
-        requestBody: { values: [["Inactive"]] },
-      });
+      for (const person of markedActive) {
+        await sheets.spreadsheets.values.update({
+          spreadsheetId: TEAM_SPREADSHEET_ID,
+          range: `${colLetter}${person.rowIdx + 1}`,
+          valueInputOption: "RAW",
+          requestBody: { values: [["Active"]] },
+        });
+      }
+
+      for (const person of markedInactive) {
+        await sheets.spreadsheets.values.update({
+          spreadsheetId: TEAM_SPREADSHEET_ID,
+          range: `${colLetter}${person.rowIdx + 1}`,
+          valueInputOption: "RAW",
+          requestBody: { values: [["Inactive"]] },
+        });
+      }
     }
 
+    if (markedActive.length > 0) {
+      console.log(`🔄 Marked ${markedActive.length} team member(s) as Active`);
+    }
     if (markedInactive.length > 0) {
       console.log(`🔄 Marked ${markedInactive.length} team member(s) as Inactive: ${markedInactive.map((u) => u.name).join(", ")}`);
     }
 
-    if (newUsers.length === 0 && updatedRoles.length === 0 && markedInactive.length === 0) {
+    if (newUsers.length === 0 && updatedRoles.length === 0 && markedActive.length === 0 && markedInactive.length === 0) {
       console.log("🔄 Streamtime sync: team sheet already up to date");
     }
 
     // Bust team cache since we may have changed the sheet
-    if (newUsers.length > 0 || updatedRoles.length > 0 || markedInactive.length > 0) {
+    if (newUsers.length > 0 || updatedRoles.length > 0 || markedActive.length > 0 || markedInactive.length > 0) {
       teamCache = null;
       teamCacheTimestamp = 0;
     }
