@@ -793,6 +793,7 @@ async function scrapePortfolio(portfolioUrl) {
       }
     }
     imageUrl = imageUrl.trim() || null;
+    console.log(`📸 ${url}: og:image=${imageUrl || "none"}`);
 
     let pageText = stripHtmlToText(html);
 
@@ -852,20 +853,38 @@ async function enrichWithPortfolios(names, roster) {
     );
     if (person) {
       const portfolioUrl = person.Portfolio || "";
-      if (portfolioUrl) {
-        matches.push({ name: person.Name, url: portfolioUrl });
-      }
+      // "Photo" column in the sheet overrides og:image (direct link to a headshot)
+      const manualPhoto = person.Photo || person["Photo URL"] || "";
+      matches.push({ name: person.Name, url: portfolioUrl, manualPhoto: manualPhoto.trim() });
     }
   }
 
-  if (matches.length === 0) return { text: "", images: {} };
+  if (matches.length === 0) {
+    console.log("📸 No portfolio URLs found for recommended people");
+    return { text: "", images: {} };
+  }
 
-  // Fetch all portfolios in parallel
+  console.log(`📸 Enriching ${matches.length} recommended people: ${matches.map((m) => `${m.name} (${m.url || "no portfolio"})`).join(", ")}`);
+
+  // Fetch all portfolios in parallel (only those with URLs)
   const results = await Promise.all(
     matches.map(async (m) => {
-      const result = await scrapePortfolio(m.url);
-      if (!result) return null;
-      return { name: m.name, summary: result.summary, imageUrl: result.imageUrl, url: m.url };
+      let scrapeResult = null;
+      if (m.url) {
+        scrapeResult = await scrapePortfolio(m.url);
+      }
+
+      // Use manual photo if provided, otherwise use og:image from scrape
+      const imageUrl = m.manualPhoto || (scrapeResult ? scrapeResult.imageUrl : null);
+      const summary = scrapeResult ? scrapeResult.summary : null;
+
+      if (!imageUrl && !summary) {
+        console.log(`📸 ${m.name}: no image or summary found`);
+        return null;
+      }
+
+      console.log(`📸 ${m.name}: image=${imageUrl ? "✅" : "❌"}, summary=${summary ? "✅" : "❌"}`);
+      return { name: m.name, summary, imageUrl, url: m.url };
     })
   );
 
@@ -889,6 +908,7 @@ async function enrichWithPortfolios(names, roster) {
     }
   }
 
+  console.log(`📸 Final: ${Object.keys(images).length} image(s), ${summaries.length} summary/summaries`);
   return { text, images };
 }
 
