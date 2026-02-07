@@ -619,6 +619,10 @@ async function fetchTeam() {
       headers.forEach((header, col) => {
         entry[header] = (row[col] || "").trim();
       });
+
+      // Skip people marked as Inactive (no longer at the company)
+      if ((entry.Status || "").toLowerCase() === "inactive") continue;
+
       team.push(entry);
     }
 
