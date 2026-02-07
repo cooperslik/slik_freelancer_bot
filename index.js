@@ -384,6 +384,132 @@ function formatStreamtimeForPrompt(streamtimeData, roster, team) {
   return text;
 }
 
+// ── Sync Streamtime users → Team Google Sheet ────────────────────────
+// Streamtime is the source of truth for who's on the team.
+// This adds missing people and updates roles, but never overwrites Comments
+// or other manually-entered columns.
+
+async function syncStreamtimeToTeamSheet() {
+  if (!STREAMTIME_API_KEY || !TEAM_SPREADSHEET_ID) return;
+
+  try {
+    console.log("🔄 Syncing Streamtime users → Team sheet...");
+
+    // 1. Fetch all Streamtime users
+    const usersData = await streamtimeFetch("/users");
+    if (!usersData || !Array.isArray(usersData)) {
+      console.warn("⚠️ Streamtime sync: could not fetch users");
+      return;
+    }
+
+    // 2. Read current team sheet
+    const { data } = await sheets.spreadsheets.values.get({
+      spreadsheetId: TEAM_SPREADSHEET_ID,
+      range: "A1:Z",
+    });
+
+    const rows = data.values || [];
+    if (rows.length < 1) {
+      console.warn("⚠️ Streamtime sync: team sheet has no headers");
+      return;
+    }
+
+    const headers = rows[0].map((h) => h.trim());
+    const nameCol = headers.findIndex((h) => h.toLowerCase() === "name");
+    const roleCol = headers.findIndex((h) => h.toLowerCase() === "role");
+
+    if (nameCol === -1) {
+      console.warn("⚠️ Streamtime sync: no 'Name' column found in team sheet");
+      return;
+    }
+
+    // 3. Build a map of existing names (normalized → row index)
+    const existingNames = new Map();
+    for (let i = 1; i < rows.length; i++) {
+      const name = (rows[i][nameCol] || "").trim();
+      if (name) {
+        existingNames.set(normalizeName(name), i);
+      }
+    }
+
+    // 4. Compare Streamtime users against the sheet
+    const newUsers = [];
+    const updatedRoles = [];
+
+    for (const u of usersData) {
+      const fullName = `${u.firstName || ""} ${u.lastName || ""}`.trim();
+      if (!fullName) continue;
+
+      // Skip users that look inactive/archived
+      if (u.isArchived || u.archived || u.isActive === false) continue;
+
+      const normalized = normalizeName(fullName);
+      const role = u.role?.name || u.jobTitle || "";
+
+      if (!existingNames.has(normalized)) {
+        // New person — needs to be added to the sheet
+        newUsers.push({ name: fullName, role });
+      } else if (roleCol >= 0 && role) {
+        // Existing person — update their role if it changed in Streamtime
+        const rowIdx = existingNames.get(normalized);
+        const currentRole = (rows[rowIdx][roleCol] || "").trim();
+        if (currentRole !== role) {
+          updatedRoles.push({ name: fullName, role, rowIdx });
+        }
+      }
+    }
+
+    // 5. Append new users to the sheet
+    if (newUsers.length > 0) {
+      const newRows = newUsers.map((u) => {
+        const row = new Array(headers.length).fill("");
+        if (nameCol >= 0) row[nameCol] = u.name;
+        if (roleCol >= 0) row[roleCol] = u.role;
+        return row;
+      });
+
+      await sheets.spreadsheets.values.append({
+        spreadsheetId: TEAM_SPREADSHEET_ID,
+        range: "A1",
+        valueInputOption: "RAW",
+        insertDataOption: "INSERT_ROWS",
+        requestBody: { values: newRows },
+      });
+
+      console.log(`🔄 Added ${newUsers.length} new team member(s) from Streamtime: ${newUsers.map((u) => u.name).join(", ")}`);
+    }
+
+    // 6. Update roles for existing users (only the Role column — nothing else)
+    for (const update of updatedRoles) {
+      const colLetter = colIndexToLetter(roleCol);
+      const sheetRow = update.rowIdx + 1; // rows array is 0-indexed, sheet is 1-indexed
+
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: TEAM_SPREADSHEET_ID,
+        range: `${colLetter}${sheetRow}`,
+        valueInputOption: "RAW",
+        requestBody: { values: [[update.role]] },
+      });
+    }
+
+    if (updatedRoles.length > 0) {
+      console.log(`🔄 Updated roles for ${updatedRoles.length} team member(s): ${updatedRoles.map((u) => `${u.name} → ${u.role}`).join(", ")}`);
+    }
+
+    if (newUsers.length === 0 && updatedRoles.length === 0) {
+      console.log("🔄 Streamtime sync: team sheet already up to date");
+    }
+
+    // Bust team cache since we may have changed the sheet
+    if (newUsers.length > 0 || updatedRoles.length > 0) {
+      teamCache = null;
+      teamCacheTimestamp = 0;
+    }
+  } catch (err) {
+    console.warn("⚠️ Streamtime sync error:", err.message);
+  }
+}
+
 // ── Read entire freelancer roster from Google Sheets ─────────────────
 
 async function fetchRoster() {
@@ -1624,6 +1750,8 @@ async function syncTabNames() {
     const stData = await fetchStreamtimeJobHistory();
     if (stData) {
       console.log(`🏢 Streamtime connected — ${stData.totalJobs} jobs, ${Object.keys(stData.personJobs).length} people mapped`);
+      // Sync Streamtime users → Team sheet (adds missing people, updates roles)
+      await syncStreamtimeToTeamSheet();
     } else {
       console.log("⚠️ Streamtime API key set but could not fetch data");
     }
