@@ -1375,9 +1375,31 @@ async function getThreadHistory(channel, threadTs, botUserId) {
   }
 }
 
+// ── Event deduplication ───────────────────────────────────────────────
+// Slack retries events when Socket Mode ack is slow, causing duplicate handler runs.
+// This prevents retries from overwriting block-enriched messages with plain text.
+const processedEvents = new Map(); // event_ts → timestamp
+const EVENT_DEDUP_TTL_MS = 60_000; // keep event IDs for 60 seconds
+
+function isDuplicateEvent(eventTs) {
+  // Clean up old entries
+  const now = Date.now();
+  for (const [ts, addedAt] of processedEvents) {
+    if (now - addedAt > EVENT_DEDUP_TTL_MS) processedEvents.delete(ts);
+  }
+  if (processedEvents.has(eventTs)) {
+    console.log(`🔄 Skipping duplicate event: ${eventTs}`);
+    return true;
+  }
+  processedEvents.set(eventTs, now);
+  return false;
+}
+
 // ── Handle messages that mention the bot ──────────────────────────────
 
 slack.event("app_mention", async ({ event, say }) => {
+  if (isDuplicateEvent(event.ts)) return;
+
   // Strip the bot mention from the message
   const query = event.text.replace(/<@[A-Z0-9]+>/g, "").trim();
 
@@ -1554,6 +1576,7 @@ slack.event("message", async ({ event, say }) => {
   // Only handle DMs (not channel messages, which are handled by app_mention)
   if (event.channel_type !== "im") return;
   if (event.bot_id) return; // ignore bot messages
+  if (isDuplicateEvent(event.ts)) return;
 
   const query = event.text.trim();
 
