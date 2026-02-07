@@ -946,24 +946,51 @@ async function checkForNewSubmissions() {
       const location = entry["Location (City, Country)"] || entry["Location"] || "";
       const about = entry["Tell us about yourself"] || entry["About"] || "";
 
-      let message = `📬 *New Freelancer Application*\n\n`;
-      message += `*${name}*`;
-      if (category) message += ` — ${category}`;
-      if (level) message += ` | ${level}`;
-      if (rate) message += ` | ${rate}/day`;
-      message += `\n`;
-      if (location) message += `📍 ${location}\n`;
-      if (capabilities) message += `🛠️ ${capabilities}\n`;
-      if (about) message += `💬 _"${about.length > 200 ? about.substring(0, 200) + "..." : about}"_\n`;
-      message += `\n`;
-      if (portfolio) message += `🔗 <${portfolio.startsWith("http") ? portfolio : "https://" + portfolio}|Portfolio>`;
-      if (linkedin) message += `${portfolio ? "  •  " : ""}🔗 <${linkedin.startsWith("http") ? linkedin : "https://" + linkedin}|LinkedIn>`;
-      if (email) message += `${portfolio || linkedin ? "  •  " : ""}📧 ${email}`;
-      message += `\n\n_React with ✅ to add to the roster, or ❌ to pass._`;
+      // Build the message text
+      let summary = `*${name}*`;
+      if (category) summary += ` — ${category}`;
+      if (level) summary += ` | ${level}`;
+      if (rate) summary += ` | ${rate}/day`;
+      summary += `\n`;
+      if (location) summary += `📍 ${location}\n`;
+      if (capabilities) summary += `🛠️ ${capabilities}\n`;
+      if (about) summary += `💬 _"${about.length > 200 ? about.substring(0, 200) + "..." : about}"_\n`;
+
+      let links = "";
+      if (portfolio) links += `🔗 <${portfolio.startsWith("http") ? portfolio : "https://" + portfolio}|Portfolio>`;
+      if (linkedin) links += `${portfolio ? "  •  " : ""}🔗 <${linkedin.startsWith("http") ? linkedin : "https://" + linkedin}|LinkedIn>`;
+      if (email) links += `${portfolio || linkedin ? "  •  " : ""}📧 ${email}`;
 
       const posted = await slack.client.chat.postMessage({
         channel: SUBMISSIONS_NOTIFY_CHANNEL,
-        text: message,
+        text: `📬 New Freelancer Application: ${name}`,
+        blocks: [
+          {
+            type: "section",
+            text: { type: "mrkdwn", text: `📬 *New Freelancer Application*\n\n${summary}` },
+          },
+          {
+            type: "section",
+            text: { type: "mrkdwn", text: links || "_No links provided_" },
+          },
+          {
+            type: "actions",
+            elements: [
+              {
+                type: "button",
+                text: { type: "plain_text", text: "✅ Add to Roster" },
+                style: "primary",
+                action_id: "approve_submission",
+              },
+              {
+                type: "button",
+                text: { type: "plain_text", text: "❌ Pass" },
+                style: "danger",
+                action_id: "reject_submission",
+              },
+            ],
+          },
+        ],
       });
 
       // Store the full submission data so we can add them to the roster when someone reacts ✅
@@ -996,30 +1023,32 @@ async function checkForNewSubmissions() {
   }
 }
 
-// ── React with ✅ to add a submitted freelancer to the roster ─────────
+// ── Button handlers for approving/rejecting freelancer submissions ────
 
-slack.event("reaction_added", async ({ event }) => {
-  // Only handle ✅ reactions (white_check_mark)
-  if (event.reaction !== "white_check_mark") return;
+slack.action("approve_submission", async ({ body, ack }) => {
+  await ack();
 
-  // Only handle reactions in the submissions channel
-  if (!SUBMISSIONS_NOTIFY_CHANNEL || event.item.channel !== SUBMISSIONS_NOTIFY_CHANNEL) return;
-
-  const messageTs = event.item.ts;
+  const messageTs = body.message.ts;
+  const channel = body.channel.id;
+  const approvedBy = body.user.name || body.user.id;
   const submission = pendingSubmissions.get(messageTs);
 
   if (!submission) {
-    console.log(`ℹ️ ✅ reaction on message ${messageTs} but no pending submission found (may be an old message)`);
+    console.log(`ℹ️ Approve clicked but no pending submission found (msg ts: ${messageTs})`);
+    await slack.client.chat.postMessage({
+      channel,
+      thread_ts: messageTs,
+      text: "⚠️ This submission has already been processed or the bot was restarted since it was posted. You'll need to add them manually.",
+    });
     return;
   }
 
-  console.log(`✅ Reaction detected — adding "${submission.name}" to roster...`);
+  console.log(`✅ "${submission.name}" approved by ${approvedBy} — adding to roster...`);
 
   try {
-    // Determine which tab to add them to
     const tabName = resolveTab(submission.category);
 
-    // First, read the headers from that tab so we know the column order
+    // Read the headers from that tab so we know the column order
     const { data } = await sheets.spreadsheets.values.get({
       spreadsheetId: SPREADSHEET_ID,
       range: `'${tabName}'!A2:Z2`, // Row 2 = headers (row 1 = title)
@@ -1069,23 +1098,61 @@ slack.event("reaction_added", async ({ event }) => {
     rosterCache = null;
     cacheTimestamp = 0;
 
-    // Post a confirmation as a reply to the original message
-    await slack.client.chat.postMessage({
-      channel: SUBMISSIONS_NOTIFY_CHANNEL,
-      thread_ts: messageTs,
-      text: `✅ *${submission.name}* has been added to the *${tabName}* tab in the roster. They're now available for recommendations.`,
+    // Update the original message — replace buttons with confirmation
+    const originalBlocks = body.message.blocks || [];
+    const updatedBlocks = originalBlocks.filter((b) => b.type !== "actions");
+    updatedBlocks.push({
+      type: "section",
+      text: { type: "mrkdwn", text: `✅ *Added to ${tabName}* by ${approvedBy}` },
     });
 
-    // Remove from pending so it can't be added twice
+    await slack.client.chat.update({
+      channel,
+      ts: messageTs,
+      blocks: updatedBlocks,
+      text: `✅ ${submission.name} added to ${tabName} by ${approvedBy}`,
+    });
+
+    // Remove from pending
     pendingSubmissions.delete(messageTs);
   } catch (error) {
     console.error(`❌ Failed to add "${submission.name}" to roster:`, error.message);
-
     await slack.client.chat.postMessage({
-      channel: SUBMISSIONS_NOTIFY_CHANNEL,
+      channel,
       thread_ts: messageTs,
       text: `⚠️ Couldn't add *${submission.name}* to the roster: ${error.message}`,
     });
+  }
+});
+
+slack.action("reject_submission", async ({ body, ack }) => {
+  await ack();
+
+  const messageTs = body.message.ts;
+  const channel = body.channel.id;
+  const rejectedBy = body.user.name || body.user.id;
+  const submission = pendingSubmissions.get(messageTs);
+  const name = submission?.name || "This applicant";
+
+  // Update the original message — replace buttons with "passed" note
+  const originalBlocks = body.message.blocks || [];
+  const updatedBlocks = originalBlocks.filter((b) => b.type !== "actions");
+  updatedBlocks.push({
+    type: "section",
+    text: { type: "mrkdwn", text: `❌ *Passed* by ${rejectedBy}` },
+  });
+
+  await slack.client.chat.update({
+    channel,
+    ts: messageTs,
+    blocks: updatedBlocks,
+    text: `❌ ${name} passed by ${rejectedBy}`,
+  });
+
+  // Remove from pending
+  if (submission) {
+    pendingSubmissions.delete(messageTs);
+    console.log(`❌ "${name}" rejected by ${rejectedBy}`);
   }
 });
 
