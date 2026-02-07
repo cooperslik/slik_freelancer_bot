@@ -118,6 +118,27 @@ async function streamtimeSearch(searchView, maxResults = 200, offset = 0) {
   );
 }
 
+// ── Paginated Streamtime search helper ───────────────────────────────
+
+async function streamtimeSearchAll(searchView, maxTotal = 2000) {
+  const all = [];
+  let offset = 0;
+  const pageSize = 200;
+
+  while (true) {
+    const data = await streamtimeSearch(searchView, pageSize, offset);
+    if (!data || !data.searchResults) break;
+
+    all.push(...data.searchResults);
+
+    if (data.searchResults.length < pageSize) break;
+    offset += pageSize;
+    if (all.length >= maxTotal) break;
+  }
+
+  return all;
+}
+
 // ── Fetch Streamtime job history and build person → jobs mapping ─────
 
 async function fetchStreamtimeJobHistory() {
@@ -129,7 +150,7 @@ async function fetchStreamtimeJobHistory() {
   }
 
   try {
-    console.log("🏢 Fetching Streamtime job history...");
+    console.log("🏢 Fetching Streamtime data...");
 
     // 1. Fetch all users to get ID → name mapping
     const usersData = await streamtimeFetch("/users");
@@ -150,44 +171,50 @@ async function fetchStreamtimeJobHistory() {
     }
     console.log(`🏢 Streamtime: ${Object.keys(userMap).length} users loaded`);
 
-    // 2. Fetch all jobs (paginated — get up to 1000)
-    const allJobs = [];
-    let offset = 0;
-    const pageSize = 200;
+    // 2. Fetch jobs, job items, and job item users in parallel
+    const [allJobs, allJobItems, allJobItemUsers] = await Promise.all([
+      streamtimeSearchAll(7, 2000),   // Jobs
+      streamtimeSearchAll(16, 5000),  // Job Items (tasks within jobs)
+      streamtimeSearchAll(17, 5000),  // Job Item Users (who's on each task + hours)
+    ]);
 
-    while (true) {
-      const jobData = await streamtimeSearch(7, pageSize, offset);
-      if (!jobData || !jobData.searchResults) break;
+    console.log(`🏢 Streamtime: ${allJobs.length} jobs, ${allJobItems.length} job items, ${allJobItemUsers.length} job item users`);
 
-      allJobs.push(...jobData.searchResults);
-
-      if (jobData.searchResults.length < pageSize) break; // Last page
-      offset += pageSize;
-
-      // Safety limit — don't fetch forever
-      if (allJobs.length >= 2000) break;
+    // 3. Build lookup maps for enrichment
+    // jobId → job info
+    const jobMap = {};
+    for (const job of allJobs) {
+      jobMap[job.id] = {
+        number: job.number || "",
+        name: job.name || "",
+        company: job.company?.name || "Unknown client",
+        status: job.jobStatus?.name || "",
+      };
     }
 
-    console.log(`🏢 Streamtime: ${allJobs.length} jobs loaded`);
+    // jobItemId → task name
+    const jobItemMap = {};
+    for (const item of allJobItems) {
+      jobItemMap[item.id] = {
+        name: item.name || "",
+        jobId: item.jobId,
+      };
+    }
 
-    // 3. Build person → jobs mapping
-    // Maps a person's full name (lowercase) to an array of jobs they've worked on
+    // 4. Build person → jobs mapping with task-level detail
     const personJobs = {};
 
+    // First pass: job-level assignments (from the users array on each job)
     for (const job of allJobs) {
       const jobInfo = {
         number: job.number || "",
         name: job.name || "",
-        fullName: job.fullName || "",
         company: job.company?.name || "Unknown client",
         status: job.jobStatus?.name || "",
-        createdDate: job.jobCreatedDate || "",
-        startDate: job.estimatedStartDate || "",
-        endDate: job.estimatedEndDate || "",
-        completedDate: job.completedDate || "",
+        tasks: [],    // Will be enriched with task-level detail
+        totalHours: 0,
       };
 
-      // Each job has a users array with {id, name}
       const jobUsers = job.users || [];
       for (const u of jobUsers) {
         const user = userMap[u.id];
@@ -199,11 +226,90 @@ async function fetchStreamtimeJobHistory() {
             fullName: user.fullName,
             displayName: user.displayName,
             role: user.role,
-            jobs: [],
+            jobs: {},      // jobId → jobInfo (deduped)
+            currentJobs: [],  // Jobs where they're currently scheduled
           };
         }
-        personJobs[key].jobs.push(jobInfo);
+        personJobs[key].jobs[job.id] = { ...jobInfo };
       }
+    }
+
+    // Second pass: enrich with task-level detail from Job Item Users
+    for (const jiu of allJobItemUsers) {
+      const user = userMap[jiu.userId];
+      if (!user) continue;
+
+      const key = user.fullName.toLowerCase();
+      const jobItem = jobItemMap[jiu.jobItemId];
+      if (!jobItem) continue;
+
+      const job = jobMap[jobItem.jobId];
+      if (!job) continue;
+
+      // Ensure person entry exists
+      if (!personJobs[key]) {
+        personJobs[key] = {
+          fullName: user.fullName,
+          displayName: user.displayName,
+          role: user.role,
+          jobs: {},
+          currentJobs: [],
+        };
+      }
+
+      // Ensure job entry exists for this person
+      if (!personJobs[key].jobs[jobItem.jobId]) {
+        personJobs[key].jobs[jobItem.jobId] = {
+          number: job.number,
+          name: job.name,
+          company: job.company,
+          status: job.status,
+          tasks: [],
+          totalHours: 0,
+        };
+      }
+
+      const personJob = personJobs[key].jobs[jobItem.jobId];
+
+      // Add the specific task they worked on
+      const hoursLogged = Math.round((jiu.totalLoggedMinutes || 0) / 60 * 10) / 10;
+      if (jobItem.name) {
+        personJob.tasks.push(jobItem.name);
+      }
+      personJob.totalHours += hoursLogged;
+
+      // Track current scheduling for availability
+      const status = jiu.jobItemUserStatus?.name || "";
+      const endDate = jiu.latestEndDate || "";
+      const today = new Date().toISOString().split("T")[0];
+
+      if ((status === "Scheduled" || status === "In Play") && (!endDate || endDate >= today)) {
+        personJobs[key].currentJobs.push({
+          jobName: `${job.number} ${job.name}`,
+          task: jobItem.name || "",
+          startDate: jiu.earliestStartDate || "",
+          endDate: endDate,
+          status,
+        });
+      }
+    }
+
+    // Convert jobs objects to arrays for cleaner output
+    for (const person of Object.values(personJobs)) {
+      person.jobList = Object.values(person.jobs);
+      // Deduplicate tasks within each job
+      for (const j of person.jobList) {
+        j.tasks = [...new Set(j.tasks)];
+        j.totalHours = Math.round(j.totalHours * 10) / 10;
+      }
+      // Deduplicate current jobs
+      const seen = new Set();
+      person.currentJobs = person.currentJobs.filter((cj) => {
+        const k = cj.jobName;
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      });
     }
 
     console.log(`🏢 Streamtime: ${Object.keys(personJobs).length} people matched to jobs`);
@@ -235,20 +341,41 @@ function formatStreamtimeForPrompt(streamtimeData, roster, team) {
     if (p.Name) knownNames.add(normalizeName(p.Name));
   }
 
-  let text = "\n\n═══ STREAMTIME JOB HISTORY ═══\n";
-  text += "(Real project data — use to match people to similar jobs/clients. Reference job numbers when recommending.)\n";
+  let text = "\n\n═══ STREAMTIME PROJECT HISTORY ═══\n";
+  text += "(Real project data from Streamtime — shows who worked on what, their tasks, hours logged, and current bookings. Use this to match people to similar jobs/clients and check availability.)\n";
 
   let includedCount = 0;
   for (const [key, person] of Object.entries(personJobs)) {
     // Only include people who are in our roster or team sheet
     if (!knownNames.has(normalizeName(person.fullName))) continue;
 
-    // Last 10 jobs per person — enough context without bloating the prompt
-    const recentJobs = person.jobs.slice(-10);
-    if (recentJobs.length === 0) continue;
+    const jobs = person.jobList || [];
+    if (jobs.length === 0) continue;
 
-    text += `\n• ${person.fullName}: `;
-    text += recentJobs.map((j) => `${j.number} ${j.name} [${j.company}]`).join(" | ");
+    // Last 10 jobs — enough context without bloating the prompt
+    const recentJobs = jobs.slice(-10);
+
+    text += `\n• ${person.fullName}`;
+
+    // Flag current bookings for availability
+    if (person.currentJobs && person.currentJobs.length > 0) {
+      const bookings = person.currentJobs.slice(0, 3);
+      text += ` [⚠️ CURRENTLY BOOKED: ${bookings.map((b) => b.jobName).join(", ")}]`;
+    }
+
+    text += "\n  ";
+    text += recentJobs.map((j) => {
+      let entry = `${j.number} ${j.name} [${j.company}]`;
+      // Add task names if available (concise)
+      if (j.tasks && j.tasks.length > 0) {
+        entry += ` (${j.tasks.slice(0, 3).join(", ")})`;
+      }
+      // Add hours if significant
+      if (j.totalHours >= 1) {
+        entry += ` ${j.totalHours}hrs`;
+      }
+      return entry;
+    }).join(" | ");
     text += "\n";
     includedCount++;
   }
