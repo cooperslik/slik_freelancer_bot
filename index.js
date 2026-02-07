@@ -24,7 +24,7 @@ const sheets = google.sheets({
       client_email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
       private_key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, "\n"),
     },
-    scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
+    scopes: ["https://www.googleapis.com/auth/spreadsheets"],
   }),
 });
 
@@ -351,6 +351,210 @@ function extractNamesFromReply(reply) {
   return names;
 }
 
+// ── Post-project feedback system ─────────────────────────────────────
+
+const REVIEW_PATTERN = /^(?:review|feedback)\s+(.+?)(?:\s*[-–—:]\s*)([\s\S]+)$/i;
+
+function detectReviewRequest(text) {
+  const match = text.match(REVIEW_PATTERN);
+  if (!match) return null;
+  return { name: match[1].trim(), feedback: match[2].trim() };
+}
+
+async function findFreelancerInSheet(name) {
+  // Search each tab for the freelancer by name (case-insensitive)
+  for (const tabName of FREELANCER_TABS) {
+    try {
+      const { data } = await sheets.spreadsheets.values.get({
+        spreadsheetId: SPREADSHEET_ID,
+        range: `'${tabName}'!A2:Z`,
+      });
+
+      const rows = data.values || [];
+      if (rows.length < 2) continue;
+
+      const headers = rows[0].map((h) => h.trim());
+      const commentsCol = headers.findIndex(
+        (h) => h.toLowerCase() === "comments"
+      );
+      const nameCol = headers.findIndex(
+        (h) => h.toLowerCase() === "name"
+      );
+
+      if (nameCol === -1) continue;
+
+      for (let i = 1; i < rows.length; i++) {
+        const row = rows[i];
+        const cellName = (row[nameCol] || "").trim();
+        if (cellName.toLowerCase() === name.toLowerCase()) {
+          // Found them — row index in sheet is i + 2 (1 for title row, 1 for header row, 0-indexed)
+          const sheetRow = i + 2; // +2 because range starts at A2 (skipping title), and rows[0] = headers
+          const currentComments = commentsCol >= 0 ? (row[commentsCol] || "").trim() : "";
+          return {
+            name: cellName,
+            tab: tabName,
+            sheetRow,
+            commentsCol: commentsCol >= 0 ? commentsCol : null,
+            currentComments,
+          };
+        }
+      }
+    } catch (err) {
+      // Skip tabs that can't be read
+    }
+  }
+
+  // Also check internal team sheet
+  if (TEAM_SPREADSHEET_ID) {
+    try {
+      const { data } = await sheets.spreadsheets.values.get({
+        spreadsheetId: TEAM_SPREADSHEET_ID,
+        range: "A1:Z",
+      });
+
+      const rows = data.values || [];
+      if (rows.length < 2) return null;
+
+      const headers = rows[0].map((h) => h.trim());
+      const commentsCol = headers.findIndex((h) => h.toLowerCase() === "comments");
+      const nameCol = headers.findIndex((h) => h.toLowerCase() === "name");
+
+      if (nameCol === -1) return null;
+
+      for (let i = 1; i < rows.length; i++) {
+        const row = rows[i];
+        const cellName = (row[nameCol] || "").trim();
+        if (cellName.toLowerCase() === name.toLowerCase()) {
+          return {
+            name: cellName,
+            tab: "Internal Team",
+            sheetRow: i + 1, // Headers in row 1, data from row 2
+            commentsCol: commentsCol >= 0 ? commentsCol : null,
+            currentComments: commentsCol >= 0 ? (row[commentsCol] || "").trim() : "",
+            isTeam: true,
+          };
+        }
+      }
+    } catch (err) {
+      // Skip if team sheet can't be read
+    }
+  }
+
+  return null;
+}
+
+function colIndexToLetter(index) {
+  let letter = "";
+  let i = index;
+  while (i >= 0) {
+    letter = String.fromCharCode((i % 26) + 65) + letter;
+    i = Math.floor(i / 26) - 1;
+  }
+  return letter;
+}
+
+async function writeFeedback(freelancer, feedback) {
+  const date = new Date().toISOString().split("T")[0]; // e.g. 2026-02-07
+  const newEntry = `[${date} via Slack] ${feedback}`;
+
+  // Append to existing comments with a separator, or start fresh
+  const updatedComments = freelancer.currentComments
+    ? `${freelancer.currentComments} | ${newEntry}`
+    : newEntry;
+
+  const spreadsheetId = freelancer.isTeam ? TEAM_SPREADSHEET_ID : SPREADSHEET_ID;
+
+  if (freelancer.commentsCol === null) {
+    // No Comments column found — can't write
+    return { success: false, reason: "no_comments_column" };
+  }
+
+  const colLetter = colIndexToLetter(freelancer.commentsCol);
+  const range = freelancer.isTeam
+    ? `${colLetter}${freelancer.sheetRow}`
+    : `'${freelancer.tab}'!${colLetter}${freelancer.sheetRow}`;
+
+  try {
+    await sheets.spreadsheets.values.update({
+      spreadsheetId,
+      range,
+      valueInputOption: "RAW",
+      requestBody: {
+        values: [[updatedComments]],
+      },
+    });
+
+    // Bust the cache so the next recommendation picks up the new feedback
+    if (freelancer.isTeam) {
+      teamCache = null;
+      teamCacheTimestamp = 0;
+    } else {
+      rosterCache = null;
+      cacheTimestamp = 0;
+    }
+
+    return { success: true };
+  } catch (err) {
+    console.error("❌ Failed to write feedback:", err.message);
+    return { success: false, reason: err.message };
+  }
+}
+
+async function handleReview(query, say, threadTs, channel) {
+  const review = detectReviewRequest(query);
+  if (!review) return false; // Not a review request — let normal handler take over
+
+  const thinking = await say({
+    text: `📝 Logging feedback for ${review.name}...`,
+    thread_ts: threadTs,
+  });
+
+  try {
+    const freelancer = await findFreelancerInSheet(review.name);
+
+    if (!freelancer) {
+      await slack.client.chat.update({
+        channel,
+        ts: thinking.ts,
+        text: `❌ Couldn't find *${review.name}* in the roster or internal team sheet. Check the spelling and try again — the name needs to match exactly as it appears in the Google Sheet.`,
+      });
+      return true;
+    }
+
+    const result = await writeFeedback(freelancer, review.feedback);
+
+    if (result.success) {
+      const source = freelancer.isTeam ? "internal team sheet" : `*${freelancer.tab}* tab`;
+      await slack.client.chat.update({
+        channel,
+        ts: thinking.ts,
+        text: `✅ Feedback logged for *${freelancer.name}* in the ${source}.\n\n> _${review.feedback}_\n\nThis will be factored into future recommendations.`,
+      });
+    } else if (result.reason === "no_comments_column") {
+      await slack.client.chat.update({
+        channel,
+        ts: thinking.ts,
+        text: `⚠️ Found *${freelancer.name}* but the ${freelancer.tab} tab doesn't have a Comments column. Add one to the sheet and try again.`,
+      });
+    } else {
+      await slack.client.chat.update({
+        channel,
+        ts: thinking.ts,
+        text: `⚠️ Found *${freelancer.name}* but couldn't write to the sheet: ${result.reason}`,
+      });
+    }
+  } catch (error) {
+    console.error("Error processing review:", error);
+    await slack.client.chat.update({
+      channel,
+      ts: thinking.ts,
+      text: "⚠️ Something went wrong logging the feedback. Please try again.",
+    });
+  }
+
+  return true; // Handled — don't pass to the normal recommendation flow
+}
+
 // ── System prompt for Claude ─────────────────────────────────────────
 
 const SYSTEM_PROMPT = `You are the Talent Finder — an AI assistant for a creative advertising agency. Your job is to recommend the best people for a project, always checking the INTERNAL STUDIO TEAM first before suggesting freelancers.
@@ -450,7 +654,7 @@ slack.event("app_mention", async ({ event, say }) => {
 
   if (!query) {
     await say({
-      text: "Hey! Tell me what kind of project you need a freelancer for and I'll check the roster. For example: _We need a senior motion designer for a 3-week brand campaign with 3D experience._",
+      text: "Hey! Tell me what kind of project you need a freelancer for and I'll check the roster. For example: _We need a senior motion designer for a 3-week brand campaign with 3D experience._\n\nYou can also log feedback: _review Jane Smith - great work, delivered on time, 9/10_",
       thread_ts: event.thread_ts || event.ts,
     });
     return;
@@ -458,6 +662,10 @@ slack.event("app_mention", async ({ event, say }) => {
 
   // Reply in the existing thread if this is a follow-up, or start a new thread
   const threadTs = event.thread_ts || event.ts;
+
+  // Check if this is a review/feedback request
+  const wasReview = await handleReview(query, say, threadTs, event.channel);
+  if (wasReview) return;
 
   // Show a thinking indicator
   const thinking = await say({
@@ -563,6 +771,10 @@ slack.event("message", async ({ event, say }) => {
   if (event.bot_id) return; // ignore bot messages
 
   const query = event.text.trim();
+
+  // Check if this is a review/feedback request
+  const wasReview = await handleReview(query, say, null, event.channel);
+  if (wasReview) return;
 
   const thinking = await say({
     text: "🔍 Checking the team and freelancer roster...",
