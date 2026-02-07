@@ -867,6 +867,35 @@ slack.event("message", async ({ event, say }) => {
 
 // ── Google Form submission watcher ────────────────────────────────────
 
+// Store submission data keyed by Slack message ts — so we can look it up when someone reacts
+const pendingSubmissions = new Map();
+
+// Map form "Primary Discipline" values to the actual tab names in the roster sheet
+const CATEGORY_TO_TAB = {
+  "creative director": "Creative Directors",
+  "ad/designer": "AD/Designers",
+  "designer": "AD/Designers",
+  "copywriter": "Copywriters",
+  "animator": "Animators",
+  "3d artist": "3D Artists",
+  "developer": "Developers",
+  "producer/am": "Producers/AM",
+  "producer": "Producers/AM",
+  "retoucher": "Retouchers",
+  "photographer/videographer": "Photographer/Videographers",
+  "photographer": "Photographer/Videographers",
+  "videographer": "Photographer/Videographers",
+  "strategist": "Strategists",
+  "specialist": "Specialists",
+  "other": "Specialists",
+};
+
+function resolveTab(category) {
+  if (!category) return "Specialists";
+  const key = category.toLowerCase().replace(/\s*\(.*?\)\s*/g, "").trim();
+  return CATEGORY_TO_TAB[key] || "Specialists";
+}
+
 let lastKnownSubmissionCount = null;
 const SUBMISSION_POLL_INTERVAL_MS = 5 * 60 * 1000; // Check every 5 minutes
 
@@ -932,10 +961,28 @@ async function checkForNewSubmissions() {
       if (email) message += `${portfolio || linkedin ? "  •  " : ""}📧 ${email}`;
       message += `\n\n_React with ✅ to add to the roster, or ❌ to pass._`;
 
-      await slack.client.chat.postMessage({
+      const posted = await slack.client.chat.postMessage({
         channel: SUBMISSIONS_NOTIFY_CHANNEL,
         text: message,
       });
+
+      // Store the full submission data so we can add them to the roster when someone reacts ✅
+      if (posted.ts) {
+        pendingSubmissions.set(posted.ts, {
+          name,
+          email,
+          category,
+          level: level.replace(/\s*\(.*?\)\s*/g, "").trim(), // Strip "(3-5 years)" etc.
+          rate,
+          capabilities,
+          portfolio,
+          linkedin,
+          location,
+          about,
+          clients: entry["Notable Clients or Brands"] || entry["Clients"] || "",
+        });
+        console.log(`📝 Stored submission for "${name}" (msg ts: ${posted.ts})`);
+      }
     }
 
     lastKnownSubmissionCount = currentCount;
@@ -948,6 +995,99 @@ async function checkForNewSubmissions() {
     console.warn("⚠️ Submission watcher error:", err.message);
   }
 }
+
+// ── React with ✅ to add a submitted freelancer to the roster ─────────
+
+slack.event("reaction_added", async ({ event }) => {
+  // Only handle ✅ reactions (white_check_mark)
+  if (event.reaction !== "white_check_mark") return;
+
+  // Only handle reactions in the submissions channel
+  if (!SUBMISSIONS_NOTIFY_CHANNEL || event.item.channel !== SUBMISSIONS_NOTIFY_CHANNEL) return;
+
+  const messageTs = event.item.ts;
+  const submission = pendingSubmissions.get(messageTs);
+
+  if (!submission) {
+    console.log(`ℹ️ ✅ reaction on message ${messageTs} but no pending submission found (may be an old message)`);
+    return;
+  }
+
+  console.log(`✅ Reaction detected — adding "${submission.name}" to roster...`);
+
+  try {
+    // Determine which tab to add them to
+    const tabName = resolveTab(submission.category);
+
+    // First, read the headers from that tab so we know the column order
+    const { data } = await sheets.spreadsheets.values.get({
+      spreadsheetId: SPREADSHEET_ID,
+      range: `'${tabName}'!A2:Z2`, // Row 2 = headers (row 1 = title)
+    });
+
+    const headers = (data.values?.[0] || []).map((h) => h.trim());
+    if (headers.length === 0) {
+      console.error(`❌ No headers found in tab "${tabName}" row 2`);
+      return;
+    }
+
+    // Build a row matching the header order
+    const newRow = headers.map((header) => {
+      const h = header.toLowerCase();
+      if (h === "name") return submission.name;
+      if (h === "availibility" || h === "availability") return "Available";
+      if (h === "level") return submission.level;
+      if (h === "capabilites" || h === "capabilities") return submission.capabilities;
+      if (h === "reccomendation" || h === "recommendation") return "";
+      if (h.includes("cost rate")) return submission.rate;
+      if (h.includes("min sell")) return "";
+      if (h === "clients") return submission.clients;
+      if (h === "portfolio") return submission.portfolio;
+      if (h === "linkedin") return submission.linkedin;
+      if (h === "email address" || h === "email") return submission.email;
+      if (h === "phone number" || h === "phone") return "";
+      if (h === "location") return submission.location;
+      if (h === "comments") return submission.about ? `[Form submission] ${submission.about}` : "[Added via intake form]";
+      if (h === "status") return "New";
+      return "";
+    });
+
+    // Append the new row to the tab
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: SPREADSHEET_ID,
+      range: `'${tabName}'!A3`,
+      valueInputOption: "RAW",
+      insertDataOption: "INSERT_ROWS",
+      requestBody: {
+        values: [newRow],
+      },
+    });
+
+    console.log(`✅ "${submission.name}" added to "${tabName}" tab`);
+
+    // Bust roster cache
+    rosterCache = null;
+    cacheTimestamp = 0;
+
+    // Post a confirmation as a reply to the original message
+    await slack.client.chat.postMessage({
+      channel: SUBMISSIONS_NOTIFY_CHANNEL,
+      thread_ts: messageTs,
+      text: `✅ *${submission.name}* has been added to the *${tabName}* tab in the roster. They're now available for recommendations.`,
+    });
+
+    // Remove from pending so it can't be added twice
+    pendingSubmissions.delete(messageTs);
+  } catch (error) {
+    console.error(`❌ Failed to add "${submission.name}" to roster:`, error.message);
+
+    await slack.client.chat.postMessage({
+      channel: SUBMISSIONS_NOTIFY_CHANNEL,
+      thread_ts: messageTs,
+      text: `⚠️ Couldn't add *${submission.name}* to the roster: ${error.message}`,
+    });
+  }
+});
 
 // ── Start the bot ────────────────────────────────────────────────────
 
