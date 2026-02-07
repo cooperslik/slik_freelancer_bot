@@ -440,7 +440,7 @@ async function scrapePortfolio(portfolioUrl) {
 
     // Use Claude to extract a short insight from the portfolio
     const summaryResponse = await anthropic.messages.create({
-      model: "claude-haiku-3-20240307",
+      model: "claude-haiku-4-5-20251001",
       max_tokens: 150,
       system:
         "You summarise freelancer portfolio websites for an agency. Given the raw text from a portfolio site, provide a 1-2 sentence summary of: what kind of work they showcase, any notable clients or brands visible, and their apparent specialty or style. Be specific and factual. If the text is too garbled or empty to summarise, reply with just: INSUFFICIENT_DATA",
