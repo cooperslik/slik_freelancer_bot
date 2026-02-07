@@ -740,7 +740,12 @@ async function scrapePortfolio(portfolioUrl) {
   // Check cache
   const cached = portfolioCache.get(url);
   if (cached && Date.now() - cached.timestamp < PORTFOLIO_CACHE_TTL_MS) {
-    return cached.data;
+    // Handle old cache format (string) vs new format ({ summary, imageUrl })
+    if (typeof cached.data === "string") {
+      portfolioCache.delete(url); // Force re-scrape with new format
+    } else {
+      return cached.data;
+    }
   }
 
   try {
@@ -770,6 +775,25 @@ async function scrapePortfolio(portfolioUrl) {
     }
 
     const html = await response.text();
+
+    // Extract og:image / twitter:image for profile thumbnail
+    const $ = cheerio.load(html);
+    let imageUrl =
+      $('meta[property="og:image"]').attr("content") ||
+      $('meta[name="og:image"]').attr("content") ||
+      $('meta[property="twitter:image"]').attr("content") ||
+      $('meta[name="twitter:image"]').attr("content") ||
+      "";
+    // Resolve relative URLs
+    if (imageUrl && !imageUrl.startsWith("http")) {
+      try {
+        imageUrl = new URL(imageUrl, url).href;
+      } catch (e) {
+        imageUrl = "";
+      }
+    }
+    imageUrl = imageUrl.trim() || null;
+
     let pageText = stripHtmlToText(html);
 
     // Truncate to ~3000 chars — enough context for a summary, not so much that it's wasteful
@@ -777,28 +801,37 @@ async function scrapePortfolio(portfolioUrl) {
       pageText = pageText.substring(0, 3000) + "...";
     }
 
-    if (pageText.length < 50) return null; // Too little content to summarise
+    let summary = null;
+    if (pageText.length >= 50) {
+      // Use Claude to extract a short insight from the portfolio
+      const summaryResponse = await claudeCreate({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 150,
+        system:
+          "You summarise freelancer portfolio websites for an agency. Given the raw text from a portfolio site, provide a 1-2 sentence summary of: what kind of work they showcase, any notable clients or brands visible, and their apparent specialty or style. Be specific and factual. If the text is too garbled or empty to summarise, reply with just: INSUFFICIENT_DATA",
+        messages: [
+          {
+            role: "user",
+            content: `Portfolio text from ${url}:\n\n${pageText}`,
+          },
+        ],
+      });
 
-    // Use Claude to extract a short insight from the portfolio
-    const summaryResponse = await claudeCreate({
-      model: "claude-haiku-4-5-20251001",
-      max_tokens: 150,
-      system:
-        "You summarise freelancer portfolio websites for an agency. Given the raw text from a portfolio site, provide a 1-2 sentence summary of: what kind of work they showcase, any notable clients or brands visible, and their apparent specialty or style. Be specific and factual. If the text is too garbled or empty to summarise, reply with just: INSUFFICIENT_DATA",
-      messages: [
-        {
-          role: "user",
-          content: `Portfolio text from ${url}:\n\n${pageText}`,
-        },
-      ],
-    });
+      const text = summaryResponse.content?.[0]?.text || null;
+      if (text && !text.includes("INSUFFICIENT_DATA")) {
+        summary = text;
+      }
+    }
 
-    const summary = summaryResponse.content?.[0]?.text || null;
-    if (!summary || summary.includes("INSUFFICIENT_DATA")) return null;
+    const result = { summary, imageUrl };
 
-    // Cache the result
-    portfolioCache.set(url, { data: summary, timestamp: Date.now() });
-    return summary;
+    // Cache if we got anything useful (summary or image)
+    if (result.summary || result.imageUrl) {
+      portfolioCache.set(url, { data: result, timestamp: Date.now() });
+      return result;
+    }
+
+    return null;
   } catch (error) {
     if (error.name === "AbortError") {
       console.error(`Portfolio fetch timed out for ${url}`);
@@ -810,6 +843,7 @@ async function scrapePortfolio(portfolioUrl) {
 }
 
 // Scrape portfolios for a list of recommended names
+// Returns { text, images } — text is the portfolio insights string, images is a name → imageUrl map
 async function enrichWithPortfolios(names, roster) {
   const matches = [];
   for (const name of names) {
@@ -824,25 +858,38 @@ async function enrichWithPortfolios(names, roster) {
     }
   }
 
-  if (matches.length === 0) return "";
+  if (matches.length === 0) return { text: "", images: {} };
 
   // Fetch all portfolios in parallel
   const results = await Promise.all(
     matches.map(async (m) => {
-      const summary = await scrapePortfolio(m.url);
-      if (!summary) return null;
-      return { name: m.name, summary, url: m.url };
+      const result = await scrapePortfolio(m.url);
+      if (!result) return null;
+      return { name: m.name, summary: result.summary, imageUrl: result.imageUrl, url: m.url };
     })
   );
 
   const validResults = results.filter((r) => r !== null);
-  if (validResults.length === 0) return "";
+  if (validResults.length === 0) return { text: "", images: {} };
 
-  let text = "\n\n🎨 *Portfolio Insights*\n";
-  for (const r of validResults) {
-    text += `• *${r.name}*: ${r.summary} (<${r.url}|View portfolio>)\n`;
+  const images = {};
+  let text = "";
+  const summaries = validResults.filter((r) => r.summary);
+
+  if (summaries.length > 0) {
+    text = "\n\n🎨 *Portfolio Insights*\n";
+    for (const r of summaries) {
+      text += `• *${r.name}*: ${r.summary} (<${r.url}|View portfolio>)\n`;
+    }
   }
-  return text;
+
+  for (const r of validResults) {
+    if (r.imageUrl) {
+      images[r.name] = r.imageUrl;
+    }
+  }
+
+  return { text, images };
 }
 
 // ── Combined enrichment ───────────────────────────────────────────────
@@ -862,6 +909,99 @@ function extractNamesFromReply(reply) {
     names.push(match[1].trim());
   }
   return names;
+}
+
+// ── Build Slack blocks with profile images from og:image ──────────────
+// Parses Claude's reply into sections and attaches portfolio images
+// as thumbnails next to each freelancer recommendation.
+
+function buildSlackBlocks(reply, images, portfolioText) {
+  if (!images || Object.keys(images).length === 0) {
+    // No images — return null to signal plain text mode
+    return null;
+  }
+
+  const blocks = [];
+
+  // Find medal emoji positions to split the reply into sections
+  const medalPattern = /[🥇🥈🥉]\s*\*#\d+\s*—\s*(.+?)\*/g;
+  const medals = [];
+  let m;
+  while ((m = medalPattern.exec(reply)) !== null) {
+    medals.push({ index: m.index, name: m[1].trim() });
+  }
+
+  if (medals.length === 0) {
+    // No structured recommendations found — fall back to plain text
+    return null;
+  }
+
+  // Everything before the first medal = internal team section + divider
+  const headerText = reply.substring(0, medals[0].index).trim();
+  if (headerText) {
+    // Split out the --- divider if present
+    const dividerIndex = headerText.lastIndexOf("---");
+    if (dividerIndex > 0) {
+      const teamPart = headerText.substring(0, dividerIndex).trim();
+      if (teamPart) {
+        blocks.push({ type: "section", text: { type: "mrkdwn", text: teamPart } });
+      }
+      blocks.push({ type: "divider" });
+    } else {
+      blocks.push({ type: "section", text: { type: "mrkdwn", text: headerText } });
+    }
+  }
+
+  // Each freelancer recommendation section
+  for (let i = 0; i < medals.length; i++) {
+    const start = medals[i].index;
+    const end = i + 1 < medals.length ? medals[i + 1].index : reply.length;
+    let sectionText = reply.substring(start, end).trim();
+
+    // Check for trailing 💡 Note inside this section (only in the last one)
+    let noteText = null;
+    const noteIndex = sectionText.indexOf("💡");
+    if (noteIndex > 0) {
+      noteText = sectionText.substring(noteIndex).trim();
+      sectionText = sectionText.substring(0, noteIndex).trim();
+    }
+
+    // Slack section text max is 3000 chars
+    if (sectionText.length > 2900) {
+      sectionText = sectionText.substring(0, 2900) + "...";
+    }
+
+    const block = {
+      type: "section",
+      text: { type: "mrkdwn", text: sectionText },
+    };
+
+    // Attach portfolio image as thumbnail if we have one
+    const name = medals[i].name;
+    const imageUrl = images[name];
+    if (imageUrl) {
+      block.accessory = {
+        type: "image",
+        image_url: imageUrl,
+        alt_text: name,
+      };
+    }
+
+    blocks.push(block);
+
+    // Add the 💡 Note as its own block
+    if (noteText) {
+      blocks.push({ type: "section", text: { type: "mrkdwn", text: noteText } });
+    }
+  }
+
+  // Add portfolio insights as a final section
+  if (portfolioText) {
+    blocks.push({ type: "divider" });
+    blocks.push({ type: "section", text: { type: "mrkdwn", text: portfolioText.trim() } });
+  }
+
+  return blocks;
 }
 
 // ── Post-project feedback system ─────────────────────────────────────
@@ -1296,22 +1436,43 @@ slack.event("app_mention", async ({ event, say }) => {
       messages,
     });
 
-    let reply =
+    const reply =
       response.content?.[0]?.text || "No recommendation could be generated.";
 
-    // Enrich with portfolio data
+    // Enrich with portfolio data + profile images
     const recommendedNames = extractNamesFromReply(reply);
+    let enrichment = { text: "", images: {} };
     if (recommendedNames.length > 0) {
-      const enrichment = await enrichRecommendations(recommendedNames, roster);
-      reply += enrichment;
+      enrichment = await enrichRecommendations(recommendedNames, roster);
     }
 
-    // Update the "thinking" message with the actual response
-    await slack.client.chat.update({
-      channel: event.channel,
-      ts: thinking.ts,
-      text: reply,
-    });
+    // Try to send as rich blocks with profile images, fall back to plain text
+    const blocks = buildSlackBlocks(reply, enrichment.images, enrichment.text);
+
+    try {
+      if (blocks) {
+        await slack.client.chat.update({
+          channel: event.channel,
+          ts: thinking.ts,
+          text: reply + enrichment.text, // fallback for notifications
+          blocks,
+        });
+      } else {
+        await slack.client.chat.update({
+          channel: event.channel,
+          ts: thinking.ts,
+          text: reply + enrichment.text,
+        });
+      }
+    } catch (blockError) {
+      // If blocks fail (e.g. invalid image URL), fall back to plain text
+      console.warn("⚠️ Block-based message failed, falling back to text:", blockError.message);
+      await slack.client.chat.update({
+        channel: event.channel,
+        ts: thinking.ts,
+        text: reply + enrichment.text,
+      });
+    }
   } catch (error) {
     console.error("Error processing request:", error);
 
@@ -1364,21 +1525,43 @@ slack.event("message", async ({ event, say }) => {
       ],
     });
 
-    let reply =
+    const reply =
       response.content?.[0]?.text || "No recommendation could be generated.";
 
-    // Enrich with portfolio data
+    // Enrich with portfolio data + profile images
     const recommendedNames = extractNamesFromReply(reply);
+    let enrichment = { text: "", images: {} };
     if (recommendedNames.length > 0) {
-      const enrichment = await enrichRecommendations(recommendedNames, roster);
-      reply += enrichment;
+      enrichment = await enrichRecommendations(recommendedNames, roster);
     }
 
-    await slack.client.chat.update({
-      channel: event.channel,
-      ts: thinking.ts,
-      text: reply,
-    });
+    // Try to send as rich blocks with profile images, fall back to plain text
+    const blocks = buildSlackBlocks(reply, enrichment.images, enrichment.text);
+
+    try {
+      if (blocks) {
+        await slack.client.chat.update({
+          channel: event.channel,
+          ts: thinking.ts,
+          text: reply + enrichment.text,
+          blocks,
+        });
+      } else {
+        await slack.client.chat.update({
+          channel: event.channel,
+          ts: thinking.ts,
+          text: reply + enrichment.text,
+        });
+      }
+    } catch (blockError) {
+      // If blocks fail (e.g. invalid image URL), fall back to plain text
+      console.warn("⚠️ Block-based message failed, falling back to text:", blockError.message);
+      await slack.client.chat.update({
+        channel: event.channel,
+        ts: thinking.ts,
+        text: reply + enrichment.text,
+      });
+    }
   } catch (error) {
     console.error("Error processing DM:", error);
     await slack.client.chat.update({
