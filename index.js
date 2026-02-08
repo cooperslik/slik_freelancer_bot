@@ -1442,36 +1442,53 @@ function extractNamesFromReply(reply) {
   return names;
 }
 
-// ── Build a simple follow-up message with images + portfolio insights ──
-// Posted as a separate message in the thread after the main recommendation.
-// Uses chat.postMessage (new message) instead of chat.update (which was
-// returning 500 when adding blocks to an existing text message).
+// ── Build profile card blocks for recommended freelancers ──────────────
+// Extracts each person's headline info from the reply text and pairs it
+// with their profile image. Uses compact blocks (like talent scout cards)
+// that Slack's API reliably accepts.
 
-function buildFollowUpBlocks(images, portfolioText) {
-  const blocks = [];
+function buildProfileCardBlocks(reply, images) {
+  if (!images || Object.keys(images).length === 0) return [];
 
-  // Add images for each person that has one
-  if (images && Object.keys(images).length > 0) {
-    for (const [name, url] of Object.entries(images)) {
-      blocks.push({
-        type: "section",
-        text: { type: "mrkdwn", text: `📷 *${name}*` },
-        accessory: {
-          type: "image",
-          image_url: url,
-          alt_text: `${name} portfolio image`,
-        },
-      });
-    }
+  // Parse the reply to extract per-person sections
+  const medalPattern = /([🥇🥈🥉])\s*\*?#(\d+)\s*—\s*(.+?)\*?\n([^\n]+)/g;
+  const people = [];
+  let match;
+  while ((match = medalPattern.exec(reply)) !== null) {
+    people.push({
+      medal: match[1],
+      rank: match[2],
+      name: match[3].trim().replace(/\*$/, ""),
+      detail: match[4].trim(), // e.g. "3D Artist & Motion Designer | Senior | $800/day"
+    });
   }
 
-  // Add portfolio insights text
-  if (portfolioText && portfolioText.trim()) {
-    if (blocks.length > 0) blocks.push({ type: "divider" });
-    blocks.push({
+  const blocks = [];
+
+  for (const person of people) {
+    // Find matching image (accent-insensitive)
+    const normalizedName = normalizeName(person.name);
+    const imageEntry = Object.entries(images).find(
+      ([k]) => normalizeName(k) === normalizedName
+    );
+    const imageUrl = imageEntry ? imageEntry[1] : null;
+
+    if (!imageUrl) continue; // only show cards for people with images
+
+    // Keep text short and clean — Slack section accessories work best with compact text
+    const cardText = `${person.medal} *#${person.rank} — ${person.name}*\n${person.detail}`;
+
+    const block = {
       type: "section",
-      text: { type: "mrkdwn", text: portfolioText.trim() },
-    });
+      text: { type: "mrkdwn", text: cardText },
+      accessory: {
+        type: "image",
+        image_url: imageUrl,
+        alt_text: person.name,
+      },
+    };
+
+    blocks.push(block);
   }
 
   return blocks;
@@ -2078,56 +2095,29 @@ slack.event("app_mention", async ({ event, say }) => {
       (async () => {
         try {
           const enrichment = await enrichRecommendations(recommendedNames, roster);
-          const hasImages = enrichment.images && Object.keys(enrichment.images).length > 0;
 
-          if (hasImages) {
-            // Build the recommendation as Slack blocks with inline profile images
-            // Pass reply (without portfolio text) — buildSlackBlocks adds portfolio text as final section
-            const blocks = buildSlackBlocks(reply, enrichment.images, enrichment.text || "");
-
-            // Validate blocks before posting
-            const validBlocks = blocks && blocks.length > 0 && blocks.every(
-              (b) => b.type && (b.type === "divider" || (b.text && b.text.text && b.text.text.trim()))
-            );
-
-            if (validBlocks) {
-              console.log(`📸 Posting ${blocks.length} blocks with ${Object.keys(enrichment.images).length} inline images`);
-              try {
-                await slack.client.chat.postMessage({
-                  channel: event.channel,
-                  thread_ts: event.ts,
-                  blocks: blocks,
-                  text: reply,
-                });
-
-                await slack.client.chat.update({
-                  channel: event.channel,
-                  ts: thinking.ts,
-                  text: "✅ See thread for recommendations with profile photos.",
-                });
-              } catch (blockErr) {
-                // Blocks failed (e.g. Slack rejected format) — fall back to plain text
-                console.warn("📸 Blocks post failed, falling back to plain text:", blockErr.message);
-                await slack.client.chat.update({
-                  channel: event.channel,
-                  ts: thinking.ts,
-                  text: enrichment.text ? reply + enrichment.text : reply,
-                });
-              }
-            } else {
-              console.warn("📸 Blocks validation failed — falling back to plain text");
-              await slack.client.chat.update({
-                channel: event.channel,
-                ts: thinking.ts,
-                text: enrichment.text ? reply + enrichment.text : reply,
-              });
-            }
-          } else if (enrichment.text) {
+          // Always update the main message with portfolio insights if we have them
+          if (enrichment.text) {
             await slack.client.chat.update({
               channel: event.channel,
               ts: thinking.ts,
               text: reply + enrichment.text,
             });
+          }
+
+          // Post profile photo cards as a follow-up in the thread
+          const hasImages = enrichment.images && Object.keys(enrichment.images).length > 0;
+          if (hasImages) {
+            const profileCards = buildProfileCardBlocks(reply, enrichment.images);
+            if (profileCards.length > 0) {
+              console.log(`📸 Posting ${profileCards.length} profile card(s) in thread`);
+              await slack.client.chat.postMessage({
+                channel: event.channel,
+                thread_ts: event.ts,
+                blocks: profileCards,
+                text: "📷 Profile photos",
+              });
+            }
           }
         } catch (e) {
           console.warn("Portfolio enrichment failed:", e.message);
@@ -2210,48 +2200,29 @@ slack.event("message", async ({ event, say }) => {
       (async () => {
         try {
           const enrichment = await enrichRecommendations(recommendedNames, roster);
-          const hasImages = enrichment.images && Object.keys(enrichment.images).length > 0;
 
-          if (hasImages) {
-            const blocks = buildSlackBlocks(reply, enrichment.images, enrichment.text || "");
-            const validBlocks = blocks && blocks.length > 0 && blocks.every(
-              (b) => b.type && (b.type === "divider" || (b.text && b.text.text && b.text.text.trim()))
-            );
-
-            if (validBlocks) {
-              try {
-                await slack.client.chat.postMessage({
-                  channel: event.channel,
-                  blocks: blocks,
-                  text: reply,
-                });
-
-                await slack.client.chat.update({
-                  channel: event.channel,
-                  ts: thinking.ts,
-                  text: "✅ See my recommendations with profile photos below.",
-                });
-              } catch (blockErr) {
-                console.warn("📸 DM blocks post failed, falling back:", blockErr.message);
-                await slack.client.chat.update({
-                  channel: event.channel,
-                  ts: thinking.ts,
-                  text: enrichment.text ? reply + enrichment.text : reply,
-                });
-              }
-            } else {
-              await slack.client.chat.update({
-                channel: event.channel,
-                ts: thinking.ts,
-                text: enrichment.text ? reply + enrichment.text : reply,
-              });
-            }
-          } else if (enrichment.text) {
+          // Update the main message with portfolio insights
+          if (enrichment.text) {
             await slack.client.chat.update({
               channel: event.channel,
               ts: thinking.ts,
               text: reply + enrichment.text,
             });
+          }
+
+          // Post profile photo cards as a follow-up
+          const hasImages = enrichment.images && Object.keys(enrichment.images).length > 0;
+          if (hasImages) {
+            const profileCards = buildProfileCardBlocks(reply, enrichment.images);
+            if (profileCards.length > 0) {
+              console.log(`📸 Posting ${profileCards.length} profile card(s) in DM`);
+              await slack.client.chat.postMessage({
+                channel: event.channel,
+                thread_ts: thinking.ts,
+                blocks: profileCards,
+                text: "📷 Profile photos",
+              });
+            }
           }
         } catch (e) {
           console.warn("Portfolio enrichment failed:", e.message);
