@@ -723,13 +723,77 @@ function formatRosterForPrompt(roster) {
 
 // ── Brief extraction (PDF attachments + Google Docs links) ───────────
 
-// Extract text from a PDF file buffer
+// Extract text from a PDF file buffer (with fallback for non-standard PDFs)
 async function extractPdfText(buffer) {
+  // Verify it's actually a PDF (should start with %PDF)
+  const header = buffer.slice(0, 5).toString("ascii");
+  if (!header.startsWith("%PDF")) {
+    console.warn(`📄 File header is "${header}" — not a standard PDF, trying anyway...`);
+  }
+
+  // Primary: use pdf-parse
   try {
     const data = await pdfParse(buffer);
-    return data.text.trim();
+    const text = data.text.trim();
+    if (text && text.length > 20) return text;
   } catch (error) {
-    console.error("PDF extraction error:", error.message);
+    console.warn("📄 pdf-parse failed:", error.message);
+  }
+
+  // Fallback: extract readable strings from the raw PDF binary
+  // Many PDFs contain readable text between stream markers
+  try {
+    const raw = buffer.toString("latin1");
+    const textChunks = [];
+    // Look for text between BT (begin text) and ET (end text) operators
+    const btPattern = /BT\s([\s\S]*?)ET/g;
+    let match;
+    while ((match = btPattern.exec(raw)) !== null) {
+      // Extract strings in parentheses (PDF text objects)
+      const tjPattern = /\(([^)]+)\)/g;
+      let tj;
+      while ((tj = tjPattern.exec(match[1])) !== null) {
+        const cleaned = tj[1].replace(/\\[nrt]/g, " ").trim();
+        if (cleaned.length > 1) textChunks.push(cleaned);
+      }
+    }
+    if (textChunks.length > 5) {
+      console.log(`📄 Fallback extraction got ${textChunks.length} text chunks`);
+      return textChunks.join(" ").replace(/\s+/g, " ").trim();
+    }
+  } catch (e) {
+    console.warn("📄 Fallback text extraction also failed:", e.message);
+  }
+
+  return null;
+}
+
+// Extract text from a DOCX file buffer (DOCX = ZIP of XML files)
+async function extractDocxText(buffer) {
+  try {
+    const AdmZip = require("adm-zip");
+    const zip = new AdmZip(buffer);
+    const entry = zip.getEntry("word/document.xml");
+    if (!entry) {
+      console.warn("📄 DOCX: no word/document.xml found in archive");
+      return null;
+    }
+    const xml = entry.getData().toString("utf-8");
+    // Strip XML tags, keep text content
+    const text = xml
+      .replace(/<w:br[^>]*\/>/g, "\n")         // line breaks
+      .replace(/<\/w:p>/g, "\n")                // paragraph breaks
+      .replace(/<[^>]+>/g, "")                  // strip all XML tags
+      .replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"')
+      .replace(/&apos;/g, "'")
+      .replace(/\n{3,}/g, "\n\n")              // collapse multiple blank lines
+      .trim();
+    return text.length > 20 ? text : null;
+  } catch (error) {
+    console.error("📄 DOCX extraction error:", error.message);
     return null;
   }
 }
@@ -780,33 +844,46 @@ function extractGoogleDocIds(text) {
 async function extractBriefContent(event) {
   const briefParts = [];
 
-  // 1. Check for PDF file attachments
+  // 1. Check for file attachments (PDF, DOCX, text)
   if (event.files && event.files.length > 0) {
     for (const file of event.files) {
-      if (file.mimetype === "application/pdf" || file.name?.endsWith(".pdf")) {
-        console.log(`📄 Downloading PDF: ${file.name} (${(file.size / 1024).toFixed(0)}KB)`);
+      const name = file.name || "unknown";
+      const mime = file.mimetype || "";
+      const isPdf = mime === "application/pdf" || name.endsWith(".pdf");
+      const isDocx = mime === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" || name.endsWith(".docx");
+      const isText = mime.startsWith("text/") || name.endsWith(".txt") || name.endsWith(".md");
+
+      if (isPdf) {
+        console.log(`📄 Downloading PDF: ${name} (${(file.size / 1024).toFixed(0)}KB)`);
         const buffer = await downloadSlackFile(file.url_private);
         if (buffer) {
           const text = await extractPdfText(buffer);
           if (text) {
-            console.log(`📄 Extracted ${text.length} chars from ${file.name}`);
-            briefParts.push(`--- PDF Brief: ${file.name} ---\n${text}`);
+            console.log(`📄 Extracted ${text.length} chars from ${name}`);
+            briefParts.push(`--- Brief: ${name} ---\n${text}`);
           } else {
-            console.warn(`📄 Could not extract text from ${file.name}`);
+            console.warn(`📄 Could not extract text from ${name}`);
           }
         }
-      } else if (
-        file.mimetype?.startsWith("text/") ||
-        file.name?.endsWith(".txt") ||
-        file.name?.endsWith(".md")
-      ) {
-        // Plain text / markdown attachments
-        console.log(`📄 Downloading text file: ${file.name}`);
+      } else if (isDocx) {
+        console.log(`📄 Downloading DOCX: ${name} (${(file.size / 1024).toFixed(0)}KB)`);
+        const buffer = await downloadSlackFile(file.url_private);
+        if (buffer) {
+          const text = await extractDocxText(buffer);
+          if (text) {
+            console.log(`📄 Extracted ${text.length} chars from ${name}`);
+            briefParts.push(`--- Brief: ${name} ---\n${text}`);
+          } else {
+            console.warn(`📄 Could not extract text from ${name}`);
+          }
+        }
+      } else if (isText) {
+        console.log(`📄 Downloading text file: ${name}`);
         const buffer = await downloadSlackFile(file.url_private);
         if (buffer) {
           const text = buffer.toString("utf-8").trim();
           if (text) {
-            briefParts.push(`--- Brief: ${file.name} ---\n${text}`);
+            briefParts.push(`--- Brief: ${name} ---\n${text}`);
           }
         }
       }
