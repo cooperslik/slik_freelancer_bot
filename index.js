@@ -1432,8 +1432,8 @@ async function enrichProfileImages() {
 // ── Extract recommended names from Claude's response ─────────────────
 
 function extractNamesFromReply(reply) {
-  // Match names after the medal emojis: 🥇 *#1 — Name* or similar patterns
-  const namePattern = /[🥇🥈🥉]\s*\*#\d+\s*—\s*(.+?)\*/g;
+  // Match names after the medal emojis — /u flag required for multi-byte Unicode emojis
+  const namePattern = /[🥇🥈🥉]\s*\*#\d+\s*—\s*(.+?)\*/gu;
   const names = [];
   let match;
   while ((match = namePattern.exec(reply)) !== null) {
@@ -1450,16 +1450,20 @@ function extractNamesFromReply(reply) {
 function buildProfileCardBlocks(reply, images) {
   if (!images || Object.keys(images).length === 0) return [];
 
-  // Parse the reply to extract per-person sections
-  const medalPattern = /([🥇🥈🥉])\s*\*?#(\d+)\s*—\s*(.+?)\*?\n([^\n]+)/g;
+  // Medal lookup — we reconstruct the emoji from rank instead of extracting it,
+  // because regex capture of multi-byte emojis (🥇🥈🥉) without the /u flag
+  // produces broken Unicode surrogates that Slack rejects as invalid_blocks_format.
+  const medalsByRank = { "1": "🥇", "2": "🥈", "3": "🥉" };
+
+  // Parse the reply to extract per-person sections (use /u flag for Unicode safety)
+  const medalPattern = /[🥇🥈🥉]\s*\*?#(\d+)\s*—\s*(.+?)\*?\n([^\n]+)/gu;
   const people = [];
   let match;
   while ((match = medalPattern.exec(reply)) !== null) {
     people.push({
-      medal: match[1],
-      rank: match[2],
-      name: match[3].trim().replace(/\*$/, ""),
-      detail: match[4].trim(), // e.g. "3D Artist & Motion Designer | Senior | $800/day"
+      rank: match[1],
+      name: match[2].trim().replace(/\*$/, ""),
+      detail: match[3].trim(),
     });
   }
 
@@ -1475,8 +1479,9 @@ function buildProfileCardBlocks(reply, images) {
 
     if (!imageUrl) continue; // only show cards for people with images
 
-    // Keep text short and clean — Slack section accessories work best with compact text
-    const cardText = `${person.medal} *#${person.rank} — ${person.name}*\n${person.detail}`;
+    // Reconstruct medal from rank number (safe Unicode)
+    const medal = medalsByRank[person.rank] || "•";
+    const cardText = `${medal} *#${person.rank} — ${person.name}*\n${person.detail}`;
 
     const block = {
       type: "section",
@@ -1506,7 +1511,7 @@ function buildSlackBlocks(reply, images, portfolioText) {
   const blocks = [];
 
   // Find medal emoji positions to split the reply into sections
-  const medalPattern = /[🥇🥈🥉]\s*\*#\d+\s*—\s*(.+?)\*/g;
+  const medalPattern = /[🥇🥈🥉]\s*\*#\d+\s*—\s*(.+?)\*/gu;
   const medals = [];
   let m;
   while ((m = medalPattern.exec(reply)) !== null) {
@@ -2108,58 +2113,18 @@ slack.event("app_mention", async ({ event, say }) => {
           // Post profile photo cards individually in the thread (one message per person)
           const hasImages = enrichment.images && Object.keys(enrichment.images).length > 0;
           if (hasImages) {
-            // Diagnostic: test if ANY block works in this thread
-            try {
-              console.log("📸 TEST: posting hardcoded test block to thread...");
-              await slack.client.chat.postMessage({
-                channel: event.channel,
-                thread_ts: event.ts,
-                blocks: [{ type: "section", text: { type: "mrkdwn", text: "📸 *Loading profile photos...*" } }],
-                text: "Loading profile photos...",
-              });
-              console.log("📸 TEST: hardcoded block worked in thread ✅");
-            } catch (testErr) {
-              console.warn(`📸 TEST: even hardcoded block failed in thread: ${testErr.message}`);
-              // Try without thread_ts
-              try {
-                await slack.client.chat.postMessage({
-                  channel: event.channel,
-                  blocks: [{ type: "section", text: { type: "mrkdwn", text: "📸 *Loading profile photos...*" } }],
-                  text: "Loading profile photos...",
-                });
-                console.log("📸 TEST: block worked WITHOUT thread_ts ✅ — threading is the issue");
-              } catch (testErr2) {
-                console.warn(`📸 TEST: block also failed without thread_ts: ${testErr2.message}`);
-              }
-            }
-
             const profileCards = buildProfileCardBlocks(reply, enrichment.images);
             for (const card of profileCards) {
               try {
-                console.log(`📸 Posting card: ${JSON.stringify(card)}`);
                 await slack.client.chat.postMessage({
                   channel: event.channel,
                   thread_ts: event.ts,
                   blocks: [card],
                   text: card.accessory ? `Photo: ${card.accessory.alt_text}` : "Profile photo",
                 });
-                console.log(`📸 Card posted ✅`);
+                console.log(`📸 Card posted for ${card.accessory?.alt_text} ✅`);
               } catch (cardErr) {
-                console.warn(`📸 Card FAILED: ${cardErr.message}`);
-                console.warn(`📸 Failed block JSON: ${JSON.stringify(card)}`);
-                // Try without image accessory to isolate the issue
-                try {
-                  const textOnly = { type: "section", text: card.text };
-                  await slack.client.chat.postMessage({
-                    channel: event.channel,
-                    thread_ts: event.ts,
-                    blocks: [textOnly],
-                    text: "Profile card (no image)",
-                  });
-                  console.warn(`📸 Text-only version worked — image URL is the problem: ${card.accessory?.image_url}`);
-                } catch (textErr) {
-                  console.warn(`📸 Even text-only failed: ${textErr.message}`);
-                }
+                console.warn(`📸 Card failed: ${cardErr.message}`);
               }
             }
           }
@@ -2260,15 +2225,15 @@ slack.event("message", async ({ event, say }) => {
             const profileCards = buildProfileCardBlocks(reply, enrichment.images);
             for (const card of profileCards) {
               try {
-                console.log(`📸 Posting DM card: ${JSON.stringify(card).substring(0, 200)}`);
                 await slack.client.chat.postMessage({
                   channel: event.channel,
                   thread_ts: thinking.ts,
                   blocks: [card],
                   text: card.accessory ? `Photo: ${card.accessory.alt_text}` : "Profile photo",
                 });
+                console.log(`📸 DM card posted for ${card.accessory?.alt_text} ✅`);
               } catch (cardErr) {
-                console.warn(`📸 DM card post failed: ${cardErr.message} | Block: ${JSON.stringify(card)}`);
+                console.warn(`📸 DM card failed: ${cardErr.message}`);
               }
             }
           }
