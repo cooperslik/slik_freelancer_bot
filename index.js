@@ -1098,17 +1098,21 @@ async function scrapePortfolio(portfolioUrl, personName) {
         score += 5;
       }
 
-      // Medium signal: image is in an "about" or "bio" section
+      // Medium signal: image is in an "about", "bio", "contact", "header", "intro" section
       // Walk up a few parent levels to check
       let parent = $(el).parent();
-      for (let depth = 0; depth < 4; depth++) {
+      for (let depth = 0; depth < 5; depth++) {
         const pClass = (parent.attr("class") || "").toLowerCase();
         const pId = (parent.attr("id") || "").toLowerCase();
-        const pTag = (parent.prop("tagName") || "").toLowerCase();
         if (pClass.includes("about") || pId.includes("about") ||
             pClass.includes("bio") || pId.includes("bio") ||
             pClass.includes("team") || pId.includes("team") ||
-            pClass.includes("author") || pId.includes("author")) {
+            pClass.includes("author") || pId.includes("author") ||
+            pClass.includes("intro") || pId.includes("intro") ||
+            pClass.includes("contact") || pId.includes("contact") ||
+            pClass.includes("founder") || pId.includes("founder") ||
+            pClass.includes("header") || pId.includes("header") ||
+            pClass.includes("hero") || pId.includes("hero")) {
           score += 6;
           break;
         }
@@ -1121,9 +1125,17 @@ async function scrapePortfolio(portfolioUrl, personName) {
       // object-cover + contained size classes often indicate headshots
       if (className.includes("object-cover")) score += 3;
 
-      if (score > 0) {
-        candidates.push({ src: absoluteSrc, score, alt, debug: allText.substring(0, 100) });
+      // Medium signal: image has width/height attributes suggesting a portrait-ish size
+      const width = parseInt($(el).attr("width") || "0", 10);
+      const height = parseInt($(el).attr("height") || "0", 10);
+      if (width > 0 && height > 0) {
+        const ratio = height / width;
+        // Square-ish or portrait (0.7 to 1.5 ratio) and reasonable size
+        if (ratio >= 0.7 && ratio <= 1.5 && width >= 80 && width <= 600) score += 4;
       }
+
+      // Collect ALL images (even score 0) so we can use the best available
+      candidates.push({ src: absoluteSrc, score, alt, debug: allText.substring(0, 100) });
     });
 
     // Sort by score descending, pick the best
@@ -1131,25 +1143,42 @@ async function scrapePortfolio(portfolioUrl, personName) {
 
     let imageUrl = null;
 
-    if (candidates.length > 0 && candidates[0].score >= 4) {
-      // Use the highest-scoring image if it has a meaningful score
+    // Also score the og:image/twitter:image as a candidate
+    const ogImage =
+      $('meta[property="og:image"]').attr("content") ||
+      $('meta[name="og:image"]').attr("content") ||
+      $('meta[property="twitter:image"]').attr("content") ||
+      $('meta[name="twitter:image"]').attr("content") ||
+      "";
+    if (ogImage) {
+      let ogAbsolute = ogImage.trim();
+      try { ogAbsolute = new URL(ogAbsolute, url).href; } catch (e) { ogAbsolute = ""; }
+      if (ogAbsolute) {
+        const ogLower = ogAbsolute.toLowerCase();
+        // Give og:image a baseline score of 2 (it's the site's chosen preview image)
+        let ogScore = 2;
+        // Boost if it contains headshot keywords or the person's name
+        for (const kw of headshotKeywords) { if (ogLower.includes(kw)) ogScore += 8; }
+        for (const frag of nameFragments) { if (ogLower.includes(frag)) ogScore += 10; }
+        // Penalize if it looks like a logo or project image
+        const ogBad = ["logo", "favicon", "icon", "banner", "project", "work", "og-default", "default"];
+        if (!ogBad.some((p) => ogLower.includes(p))) {
+          candidates.push({ src: ogAbsolute, score: ogScore, alt: "og:image", debug: "og:image" });
+        }
+      }
+    }
+
+    // Sort by score descending
+    candidates.sort((a, b) => b.score - a.score);
+
+    if (candidates.length > 0 && candidates[0].score >= 3) {
       imageUrl = candidates[0].src;
-      console.log(`📸 ${url}: found headshot (score=${candidates[0].score}): ${imageUrl}`);
+      console.log(`📸 ${url}: best image (score=${candidates[0].score}): ${imageUrl.substring(imageUrl.lastIndexOf("/") + 1).substring(0, 50)}`);
       if (candidates.length > 1) {
         console.log(`📸   runners-up: ${candidates.slice(1, 3).map((c) => `score=${c.score} ${c.src.substring(c.src.lastIndexOf("/") + 1).substring(0, 40)}`).join(", ")}`);
       }
     } else {
-      // Fall back to og:image only if no good headshot candidate found
-      const ogImage =
-        $('meta[property="og:image"]').attr("content") ||
-        $('meta[name="og:image"]').attr("content") ||
-        $('meta[property="twitter:image"]').attr("content") ||
-        $('meta[name="twitter:image"]').attr("content") ||
-        "";
-      if (ogImage) {
-        try { imageUrl = new URL(ogImage.trim(), url).href; } catch (e) { imageUrl = null; }
-      }
-      console.log(`📸 ${url}: no headshot found in page images, og:image fallback=${imageUrl || "none"}`);
+      console.log(`📸 ${url}: no suitable image found (${candidates.length} candidates, best score=${candidates.length > 0 ? candidates[0].score : 0})`);
     }
 
     // Ensure HTTPS for Slack
@@ -1236,11 +1265,20 @@ async function enrichWithPortfolios(names, roster) {
         scrapeResult = await scrapePortfolio(m.url, m.name);
       }
 
-      // Use manual photo if provided, otherwise use og:image from scrape
+      // Use manual photo if provided, otherwise use scraped image
       let imageUrl = m.manualPhoto || (scrapeResult ? scrapeResult.imageUrl : null);
       // Ensure HTTPS for Slack blocks
       if (imageUrl && imageUrl.startsWith("http://")) {
         imageUrl = imageUrl.replace("http://", "https://");
+      }
+      // Filter out URLs that are clearly not headshots (logos, icons, tiny images)
+      if (imageUrl) {
+        const urlLower = imageUrl.toLowerCase();
+        const badPatterns = ["logo", "favicon", "icon", "badge", "banner", "sprite", "1x1", "pixel", "placeholder", "default"];
+        if (badPatterns.some((p) => urlLower.includes(p))) {
+          console.log(`📸 ${m.name}: filtered out bad image URL (${urlLower.substring(urlLower.lastIndexOf("/") + 1, urlLower.lastIndexOf("/") + 40)})`);
+          imageUrl = null;
+        }
       }
       const summary = scrapeResult ? scrapeResult.summary : null;
 
@@ -1529,12 +1567,20 @@ function buildSlackBlocks(reply, images, portfolioText) {
   }
 
   // Add portfolio insights as a final section
-  if (portfolioText) {
+  if (portfolioText && portfolioText.trim()) {
+    let pText = portfolioText.trim();
+    if (pText.length > 2900) pText = pText.substring(0, 2900) + "...";
     blocks.push({ type: "divider" });
-    blocks.push({ type: "section", text: { type: "mrkdwn", text: portfolioText.trim() } });
+    blocks.push({ type: "section", text: { type: "mrkdwn", text: pText } });
   }
 
-  return blocks;
+  // Final safety: remove any blocks with empty or missing text (except dividers)
+  const safeBlocks = blocks.filter((b) => {
+    if (b.type === "divider") return true;
+    return b.text && b.text.text && b.text.text.trim().length > 0;
+  });
+
+  return safeBlocks;
 }
 
 // ── Post-project feedback system ─────────────────────────────────────
@@ -2035,29 +2081,41 @@ slack.event("app_mention", async ({ event, say }) => {
           const hasImages = enrichment.images && Object.keys(enrichment.images).length > 0;
 
           if (hasImages) {
-            // Build the full recommendation as Slack blocks with inline profile images
-            // chat.update with blocks returns 500, so we post a NEW message with blocks
-            // and update the original to a short pointer
-            const fullText = enrichment.text ? reply + enrichment.text : reply;
-            const blocks = buildSlackBlocks(fullText, enrichment.images, enrichment.text);
+            // Build the recommendation as Slack blocks with inline profile images
+            // Pass reply (without portfolio text) — buildSlackBlocks adds portfolio text as final section
+            const blocks = buildSlackBlocks(reply, enrichment.images, enrichment.text || "");
 
-            if (blocks && blocks.length > 0) {
-              // Post the rich blocks version as a reply in the thread
-              await slack.client.chat.postMessage({
-                channel: event.channel,
-                thread_ts: event.ts,
-                blocks: blocks,
-                text: reply, // fallback for notifications
-              });
+            // Validate blocks before posting
+            const validBlocks = blocks && blocks.length > 0 && blocks.every(
+              (b) => b.type && (b.type === "divider" || (b.text && b.text.text && b.text.text.trim()))
+            );
 
-              // Update the original thinking message to a short pointer
-              await slack.client.chat.update({
-                channel: event.channel,
-                ts: thinking.ts,
-                text: "✅ Recommendations posted in thread — see below for details and profile photos.",
-              });
+            if (validBlocks) {
+              console.log(`📸 Posting ${blocks.length} blocks with ${Object.keys(enrichment.images).length} inline images`);
+              try {
+                await slack.client.chat.postMessage({
+                  channel: event.channel,
+                  thread_ts: event.ts,
+                  blocks: blocks,
+                  text: reply,
+                });
+
+                await slack.client.chat.update({
+                  channel: event.channel,
+                  ts: thinking.ts,
+                  text: "✅ See thread for recommendations with profile photos.",
+                });
+              } catch (blockErr) {
+                // Blocks failed (e.g. Slack rejected format) — fall back to plain text
+                console.warn("📸 Blocks post failed, falling back to plain text:", blockErr.message);
+                await slack.client.chat.update({
+                  channel: event.channel,
+                  ts: thinking.ts,
+                  text: enrichment.text ? reply + enrichment.text : reply,
+                });
+              }
             } else {
-              // Blocks failed to build — fall back to plain text with portfolio insights
+              console.warn("📸 Blocks validation failed — falling back to plain text");
               await slack.client.chat.update({
                 channel: event.channel,
                 ts: thinking.ts,
@@ -2065,7 +2123,6 @@ slack.event("app_mention", async ({ event, say }) => {
               });
             }
           } else if (enrichment.text) {
-            // No images but we have portfolio insights — append text
             await slack.client.chat.update({
               channel: event.channel,
               ts: thinking.ts,
@@ -2156,23 +2213,32 @@ slack.event("message", async ({ event, say }) => {
           const hasImages = enrichment.images && Object.keys(enrichment.images).length > 0;
 
           if (hasImages) {
-            const fullText = enrichment.text ? reply + enrichment.text : reply;
-            const blocks = buildSlackBlocks(fullText, enrichment.images, enrichment.text);
+            const blocks = buildSlackBlocks(reply, enrichment.images, enrichment.text || "");
+            const validBlocks = blocks && blocks.length > 0 && blocks.every(
+              (b) => b.type && (b.type === "divider" || (b.text && b.text.text && b.text.text.trim()))
+            );
 
-            if (blocks && blocks.length > 0) {
-              // In DMs there's no threading — just post the blocks version
-              await slack.client.chat.postMessage({
-                channel: event.channel,
-                blocks: blocks,
-                text: reply,
-              });
+            if (validBlocks) {
+              try {
+                await slack.client.chat.postMessage({
+                  channel: event.channel,
+                  blocks: blocks,
+                  text: reply,
+                });
 
-              // Shorten the original to avoid duplication
-              await slack.client.chat.update({
-                channel: event.channel,
-                ts: thinking.ts,
-                text: "✅ See my recommendations with profile photos below.",
-              });
+                await slack.client.chat.update({
+                  channel: event.channel,
+                  ts: thinking.ts,
+                  text: "✅ See my recommendations with profile photos below.",
+                });
+              } catch (blockErr) {
+                console.warn("📸 DM blocks post failed, falling back:", blockErr.message);
+                await slack.client.chat.update({
+                  channel: event.channel,
+                  ts: thinking.ts,
+                  text: enrichment.text ? reply + enrichment.text : reply,
+                });
+              }
             } else {
               await slack.client.chat.update({
                 channel: event.channel,
