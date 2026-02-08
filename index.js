@@ -3,6 +3,7 @@ const { App } = require("@slack/bolt");
 const { google } = require("googleapis");
 const Anthropic = require("@anthropic-ai/sdk");
 const cheerio = require("cheerio");
+const pdfParse = require("pdf-parse");
 
 // ── Initialise clients ──────────────────────────────────────────────
 
@@ -17,16 +18,19 @@ const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
 });
 
-const sheets = google.sheets({
-  version: "v4",
-  auth: new google.auth.GoogleAuth({
-    credentials: {
-      client_email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
-      private_key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, "\n"),
-    },
-    scopes: ["https://www.googleapis.com/auth/spreadsheets"],
-  }),
+const googleAuth = new google.auth.GoogleAuth({
+  credentials: {
+    client_email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
+    private_key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, "\n"),
+  },
+  scopes: [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive.readonly",
+  ],
 });
+
+const sheets = google.sheets({ version: "v4", auth: googleAuth });
+const drive = google.drive({ version: "v3", auth: googleAuth });
 
 const SPREADSHEET_ID = process.env.GOOGLE_SPREADSHEET_ID;
 const TEAM_SPREADSHEET_ID = process.env.GOOGLE_TEAM_SPREADSHEET_ID || null;
@@ -715,6 +719,118 @@ function formatRosterForPrompt(roster) {
     }
   }
   return text;
+}
+
+// ── Brief extraction (PDF attachments + Google Docs links) ───────────
+
+// Extract text from a PDF file buffer
+async function extractPdfText(buffer) {
+  try {
+    const data = await pdfParse(buffer);
+    return data.text.trim();
+  } catch (error) {
+    console.error("PDF extraction error:", error.message);
+    return null;
+  }
+}
+
+// Download a file from Slack (requires bot token for private URLs)
+async function downloadSlackFile(fileUrl) {
+  try {
+    const response = await fetch(fileUrl, {
+      headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return Buffer.from(await response.arrayBuffer());
+  } catch (error) {
+    console.error("Slack file download error:", error.message);
+    return null;
+  }
+}
+
+// Fetch content from a Google Doc via Drive API (exports as plain text)
+async function fetchGoogleDocContent(docId) {
+  try {
+    const response = await drive.files.export({
+      fileId: docId,
+      mimeType: "text/plain",
+    });
+    return typeof response.data === "string"
+      ? response.data.trim()
+      : String(response.data).trim();
+  } catch (error) {
+    console.error(`Google Doc fetch error (${docId}):`, error.message);
+    return null;
+  }
+}
+
+// Parse Google Doc/Slides/Sheet URLs from message text
+// Supports: docs.google.com/document/d/DOC_ID/...
+function extractGoogleDocIds(text) {
+  const pattern = /docs\.google\.com\/document\/d\/([a-zA-Z0-9_-]+)/g;
+  const ids = [];
+  let match;
+  while ((match = pattern.exec(text)) !== null) {
+    ids.push(match[1]);
+  }
+  return ids;
+}
+
+// Extract brief content from all attachments and Google Doc links in a message
+async function extractBriefContent(event) {
+  const briefParts = [];
+
+  // 1. Check for PDF file attachments
+  if (event.files && event.files.length > 0) {
+    for (const file of event.files) {
+      if (file.mimetype === "application/pdf" || file.name?.endsWith(".pdf")) {
+        console.log(`📄 Downloading PDF: ${file.name} (${(file.size / 1024).toFixed(0)}KB)`);
+        const buffer = await downloadSlackFile(file.url_private);
+        if (buffer) {
+          const text = await extractPdfText(buffer);
+          if (text) {
+            console.log(`📄 Extracted ${text.length} chars from ${file.name}`);
+            briefParts.push(`--- PDF Brief: ${file.name} ---\n${text}`);
+          } else {
+            console.warn(`📄 Could not extract text from ${file.name}`);
+          }
+        }
+      } else if (
+        file.mimetype?.startsWith("text/") ||
+        file.name?.endsWith(".txt") ||
+        file.name?.endsWith(".md")
+      ) {
+        // Plain text / markdown attachments
+        console.log(`📄 Downloading text file: ${file.name}`);
+        const buffer = await downloadSlackFile(file.url_private);
+        if (buffer) {
+          const text = buffer.toString("utf-8").trim();
+          if (text) {
+            briefParts.push(`--- Brief: ${file.name} ---\n${text}`);
+          }
+        }
+      }
+    }
+  }
+
+  // 2. Check for Google Doc links in the message text
+  const messageText = event.text || "";
+  const docIds = extractGoogleDocIds(messageText);
+  for (const docId of docIds) {
+    console.log(`📄 Fetching Google Doc: ${docId}`);
+    const text = await fetchGoogleDocContent(docId);
+    if (text) {
+      console.log(`📄 Extracted ${text.length} chars from Google Doc`);
+      briefParts.push(`--- Google Doc Brief ---\n${text}`);
+    } else {
+      console.warn(`📄 Could not fetch Google Doc ${docId} — make sure it's shared with the service account`);
+    }
+  }
+
+  if (briefParts.length > 0) {
+    return briefParts.join("\n\n");
+  }
+  return null;
 }
 
 // ── Portfolio scraping ────────────────────────────────────────────────
@@ -1439,7 +1555,7 @@ slack.event("app_mention", async ({ event, say }) => {
 
   if (!query) {
     await say({
-      text: "Hey! Tell me what kind of project you need a freelancer for and I'll check the roster. For example: _We need a senior motion designer for a 3-week brand campaign with 3D experience._\n\nYou can also log feedback: _review Jane Smith - great work, delivered on time, 9/10_",
+      text: "Hey! Tell me what kind of project you need a freelancer for and I'll check the roster. For example: _We need a senior motion designer for a 3-week brand campaign with 3D experience._\n\n📄 You can also attach a *PDF brief* or paste a *Google Doc link* and I'll read it for context.\n\nTo log feedback: _review Jane Smith - great work, delivered on time, 9/10_",
       thread_ts: event.thread_ts || event.ts,
     });
     return;
@@ -1459,16 +1575,24 @@ slack.event("app_mention", async ({ event, say }) => {
   });
 
   try {
-    // Fetch latest data from both sheets + Streamtime
-    const [roster, team, streamtime] = await Promise.all([
+    // Fetch latest data, Streamtime history, and any attached briefs in parallel
+    const [roster, team, streamtime, briefContent] = await Promise.all([
       fetchRoster(),
       fetchTeam(),
       fetchStreamtimeJobHistory(),
+      extractBriefContent(event),
     ]);
     const rosterText = formatRosterForPrompt(roster);
     const teamText = formatTeamForPrompt(team);
     const streamtimeText = formatStreamtimeForPrompt(streamtime, roster, team);
     const allData = teamText + "\n" + rosterText + streamtimeText;
+
+    // Build the request text — include brief content if found
+    let requestText = query;
+    if (briefContent) {
+      requestText = `${query}\n\n📄 ATTACHED BRIEF:\n${briefContent}`;
+      console.log(`📄 Brief attached (${briefContent.length} chars) — included in prompt`);
+    }
 
     // Check if this is a follow-up in an existing thread
     const isFollowUp = !!event.thread_ts;
@@ -1500,10 +1624,10 @@ slack.event("app_mention", async ({ event, say }) => {
           messages.push(threadHistory[i]);
         }
 
-        // Add the new follow-up question
+        // Add the new follow-up question (with brief if attached)
         messages.push({
           role: "user",
-          content: query,
+          content: requestText,
         });
       }
     }
@@ -1513,7 +1637,7 @@ slack.event("app_mention", async ({ event, say }) => {
       messages = [
         {
           role: "user",
-          content: `Here is the internal team and freelancer roster:\n${allData}\n\n---\n\nRequest: ${query}`,
+          content: `Here is the internal team and freelancer roster:\n${allData}\n\n---\n\nRequest: ${requestText}`,
         },
       ];
     }
@@ -1584,16 +1708,23 @@ slack.event("message", async ({ event, say }) => {
   });
 
   try {
-    // Fetch latest data from both sheets + Streamtime
-    const [roster, team, streamtime] = await Promise.all([
+    // Fetch latest data, Streamtime history, and any attached briefs in parallel
+    const [roster, team, streamtime, briefContent] = await Promise.all([
       fetchRoster(),
       fetchTeam(),
       fetchStreamtimeJobHistory(),
+      extractBriefContent(event),
     ]);
     const rosterText = formatRosterForPrompt(roster);
     const teamText = formatTeamForPrompt(team);
     const streamtimeText = formatStreamtimeForPrompt(streamtime, roster, team);
     const allData = teamText + "\n" + rosterText + streamtimeText;
+
+    let requestText = query;
+    if (briefContent) {
+      requestText = `${query}\n\n📄 ATTACHED BRIEF:\n${briefContent}`;
+      console.log(`📄 [DM] Brief attached (${briefContent.length} chars) — included in prompt`);
+    }
 
     const response = await claudeCreate({
       model: "claude-sonnet-4-20250514",
@@ -1602,7 +1733,7 @@ slack.event("message", async ({ event, say }) => {
       messages: [
         {
           role: "user",
-          content: `Here is the internal team and freelancer roster:\n${allData}\n\n---\n\nRequest: ${query}`,
+          content: `Here is the internal team and freelancer roster:\n${allData}\n\n---\n\nRequest: ${requestText}`,
         },
       ],
     });
