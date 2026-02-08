@@ -2286,6 +2286,7 @@ slack.action("reject_submission", async ({ body, ack }) => {
 
 const TALENT_SCOUT_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const seenTalentNames = new Set(); // In-memory dedup — persisted via Google Sheet tab
+let talentScoutRunning = false; // Prevent concurrent runs
 
 // Launch a headless browser for scraping JS-rendered sites
 async function launchBrowser() {
@@ -2333,12 +2334,16 @@ async function scrapeDirectory(url) {
           const card = el.closest("[class*='card']") || el.closest("[class*='member']") || el.closest("[class*='artist']") || el;
           const allText = card.innerText.trim().split("\n").map((s) => s.trim()).filter(Boolean);
 
-          // First meaningful text line is usually the name
-          const name = allText[0] || "";
-          const role = allText[1] || "";
+          // Skip badge/tag text like "NEW", "FEATURED", etc. to find the actual name
+          const skipWords = new Set(["new", "featured", "pro", "verified", "top", "hire", "view", "profile"]);
+          const meaningfulText = allText.filter((t) => !skipWords.has(t.toLowerCase()) && t.length > 2);
+
+          const name = meaningfulText[0] || "";
+          const role = meaningfulText[1] || "";
           const location = allText.find((t) => /sydney|melbourne|brisbane|perth|adelaide|auckland|wellington|australia|nz/i.test(t)) || "";
 
-          if (name && name.length > 1 && name.length < 60) {
+          // Only include if name looks like an actual person name (has a space = first + last)
+          if (name && name.length > 3 && name.length < 60 && name.includes(" ")) {
             results.push({ name, role, location, profileUrl: fullUrl, source: "NodePro" });
           }
         });
@@ -2414,13 +2419,18 @@ async function scrapeProfile(profileUrl, browser) {
       let profileImage = makeAbsolute(ogImage);
 
       // If no og:image or it's a generic site image, look for actual profile photos
-      if (!profileImage || profileImage.includes("logo") || profileImage.includes("favicon")) {
+      if (!profileImage || profileImage.includes("logo") || profileImage.includes("favicon") || profileImage.includes("og-default") || profileImage.includes("default")) {
         profileImage = "";
       }
 
       if (!profileImage) {
         // Look for common profile image patterns
         const imgCandidates = [
+          // NodePro-specific: headshot images hosted on pockethost with rounded-2xl class
+          document.querySelector('img[class*="rounded-2xl"][class*="object-cover"]'),
+          document.querySelector('img[src*="pockethost"]'),
+          document.querySelector('img[src*="headshot"]'),
+          // Generic patterns
           document.querySelector('img[class*="avatar"]'),
           document.querySelector('img[class*="profile"]'),
           document.querySelector('img[class*="photo"]'),
@@ -2431,7 +2441,7 @@ async function scrapeProfile(profileUrl, browser) {
           document.querySelector('img[class*="banner"]'),
         ];
         for (const img of imgCandidates) {
-          if (img && img.src && !img.src.includes("placeholder") && !img.src.includes("default") && !img.src.includes("logo")) {
+          if (img && img.src && !img.src.includes("placeholder") && !img.src.includes("default") && !img.src.includes("logo") && !img.src.includes("og-default")) {
             profileImage = makeAbsolute(img.src);
             break;
           }
@@ -2546,6 +2556,11 @@ function isInRoster(name, roster) {
 // Main talent scout function
 async function runTalentScout() {
   if (!TALENT_SCOUT_CHANNEL || TALENT_SCOUT_SOURCES.length === 0) return;
+  if (talentScoutRunning) {
+    console.log("🔍 Talent Scout: already running — skipping");
+    return;
+  }
+  talentScoutRunning = true;
 
   console.log("🔍 Talent Scout: starting weekly scan...");
 
@@ -2750,6 +2765,8 @@ SUMMARY: [2-3 sentence summary]`,
     console.log(`🔍 Talent Scout: posted ${enriched.length} new profiles to Slack`);
   } catch (err) {
     console.warn("🔍 Talent Scout error:", err.message);
+  } finally {
+    talentScoutRunning = false;
   }
 }
 
