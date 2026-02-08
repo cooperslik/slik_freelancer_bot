@@ -2399,9 +2399,25 @@ async function scrapeProfile(profileUrl, browser) {
       const metaDesc = document.querySelector('meta[name="description"]')?.content || "";
       const ogDesc = document.querySelector('meta[property="og:description"]')?.content || "";
       const ogImage = document.querySelector('meta[property="og:image"]')?.content || "";
+      const origin = window.location.origin;
 
-      // Try to find a profile/avatar image if no og:image
-      let profileImage = ogImage;
+      // Helper: make sure image URL is absolute
+      function makeAbsolute(url) {
+        if (!url) return "";
+        if (url.startsWith("http")) return url;
+        if (url.startsWith("//")) return "https:" + url;
+        if (url.startsWith("/")) return origin + url;
+        return origin + "/" + url;
+      }
+
+      // Try to find profile image from multiple sources
+      let profileImage = makeAbsolute(ogImage);
+
+      // If no og:image or it's a generic site image, look for actual profile photos
+      if (!profileImage || profileImage.includes("logo") || profileImage.includes("favicon")) {
+        profileImage = "";
+      }
+
       if (!profileImage) {
         // Look for common profile image patterns
         const imgCandidates = [
@@ -2411,16 +2427,32 @@ async function scrapeProfile(profileUrl, browser) {
           document.querySelector('img[class*="headshot"]'),
           document.querySelector('img[alt*="profile"]'),
           document.querySelector('.profile img, .avatar img, .hero img'),
-          // NodePro uses large hero/feature images
           document.querySelector('img[class*="hero"]'),
           document.querySelector('img[class*="banner"]'),
         ];
         for (const img of imgCandidates) {
-          if (img && img.src && !img.src.includes("placeholder") && !img.src.includes("default")) {
-            profileImage = img.src;
+          if (img && img.src && !img.src.includes("placeholder") && !img.src.includes("default") && !img.src.includes("logo")) {
+            profileImage = makeAbsolute(img.src);
             break;
           }
         }
+      }
+
+      // Last resort: find the largest visible image on the page (likely showreel/portfolio thumbnail)
+      if (!profileImage) {
+        let bestImg = "";
+        let bestArea = 0;
+        document.querySelectorAll("img").forEach((img) => {
+          const w = img.naturalWidth || img.width || 0;
+          const h = img.naturalHeight || img.height || 0;
+          const area = w * h;
+          const src = img.src || "";
+          if (area > bestArea && area > 10000 && src && !src.includes("logo") && !src.includes("icon") && !src.includes("placeholder") && !src.includes("data:")) {
+            bestArea = area;
+            bestImg = src;
+          }
+        });
+        if (bestImg) profileImage = makeAbsolute(bestImg);
       }
 
       // Remove noise
@@ -2569,6 +2601,9 @@ async function runTalentScout() {
       const profile = batch[i];
       console.log(`🔍 Talent Scout: scraping profile ${i + 1}/${batch.length}: ${profile.name}`);
       const detail = await scrapeProfile(profile.profileUrl, profileBrowser);
+      if (detail?.profileImage) {
+        console.log(`🔍 Talent Scout: image found for ${profile.name}: ${detail.profileImage.substring(0, 100)}`);
+      }
       // Small delay between profile fetches
       await new Promise((r) => setTimeout(r, 500));
 
