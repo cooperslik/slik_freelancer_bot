@@ -1173,6 +1173,110 @@ async function enrichRecommendations(names, roster) {
   return await enrichWithPortfolios(names, roster);
 }
 
+// ── Profile Image Enrichment — scrape portfolio sites for headshots ──
+// Runs in background, finds freelancers with a portfolio URL but no profile image,
+// scrapes the og:image, and writes it back to the Google Sheet.
+
+async function enrichProfileImages() {
+  console.log("📸 Profile Image Enrichment: starting...");
+
+  try {
+    // Need to read fresh data (bypass cache) to see current Profile Image column
+    const updates = []; // { tabName, rowIndex, colIndex, imageUrl }
+
+    for (const tabName of FREELANCER_TABS) {
+      try {
+        const { data } = await sheets.spreadsheets.values.get({
+          spreadsheetId: SPREADSHEET_ID,
+          range: `'${tabName}'!A2:Z`,
+        });
+
+        const rows = data.values || [];
+        if (rows.length < 2) continue;
+
+        const headers = rows[0].map((h) => h.trim());
+        const nameCol = headers.findIndex((h) => h.toLowerCase() === "name");
+        const portfolioCol = headers.findIndex((h) => h.toLowerCase() === "portfolio");
+        const imageCol = headers.findIndex((h) =>
+          h.toLowerCase() === "profile image" || h.toLowerCase() === "profile image url" || h.toLowerCase() === "image"
+        );
+
+        if (nameCol < 0 || portfolioCol < 0 || imageCol < 0) continue;
+
+        for (let i = 1; i < rows.length; i++) {
+          const row = rows[i];
+          const name = (row[nameCol] || "").trim();
+          const portfolio = (row[portfolioCol] || "").trim();
+          const existingImage = (row[imageCol] || "").trim();
+
+          // Skip if no portfolio URL or already has an image
+          if (!name || !portfolio || existingImage) continue;
+
+          updates.push({
+            tabName,
+            name,
+            portfolio,
+            // Row 2 = headers, data starts at row 3 (i=1 means row 3)
+            rowNumber: i + 2, // +2 because: row 1 = tab title, row 2 = headers, data starts row 3
+            colIndex: imageCol,
+          });
+        }
+      } catch (err) {
+        // Tab might not exist or be unreadable
+      }
+    }
+
+    if (updates.length === 0) {
+      console.log("📸 Profile Image Enrichment: all freelancers already have images (or no 'Profile Image' column found)");
+      return;
+    }
+
+    console.log(`📸 Profile Image Enrichment: ${updates.length} freelancer(s) need images`);
+
+    // Process in batches of 5 to be polite
+    let enrichedCount = 0;
+    for (let i = 0; i < updates.length && i < 20; i++) {
+      const item = updates[i];
+
+      try {
+        const result = await scrapePortfolio(item.portfolio);
+        if (result && result.imageUrl) {
+          // Write the image URL to the sheet
+          const colLetter = String.fromCharCode(65 + item.colIndex); // A=0, B=1, etc.
+          const cellRange = `'${item.tabName}'!${colLetter}${item.rowNumber}`;
+
+          await sheets.spreadsheets.values.update({
+            spreadsheetId: SPREADSHEET_ID,
+            range: cellRange,
+            valueInputOption: "RAW",
+            requestBody: {
+              values: [[result.imageUrl]],
+            },
+          });
+
+          console.log(`📸 ${item.name}: saved image URL to ${cellRange}`);
+          enrichedCount++;
+        } else {
+          console.log(`📸 ${item.name}: no image found on portfolio`);
+        }
+      } catch (err) {
+        console.warn(`📸 ${item.name}: error — ${err.message}`);
+      }
+
+      // Be polite between requests
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+
+    // Bust cache so next roster fetch picks up the new images
+    rosterCache = null;
+    cacheTimestamp = 0;
+
+    console.log(`📸 Profile Image Enrichment: done — ${enrichedCount} image(s) added`);
+  } catch (err) {
+    console.warn("📸 Profile Image Enrichment error:", err.message);
+  }
+}
+
 // ── Extract recommended names from Claude's response ─────────────────
 
 function extractNamesFromReply(reply) {
@@ -2818,6 +2922,7 @@ slack.action("approve_scout", async ({ body, ack }) => {
       if (h === "capabilites" || h === "capabilities") return profile.category || "";
       if (h === "portfolio") return profile.portfolio || "";
       if (h === "location") return profile.location || "";
+      if (h === "profile image" || h === "profile image url" || h === "image") return profile.image || "";
       if (h === "comments") return profile.about
         ? `[Talent Scout - ${profile.source}] ${profile.about}`
         : `[Found via Talent Scout - ${profile.source}]`;
@@ -2975,4 +3080,9 @@ async function syncTabNames() {
   } else {
     console.log("ℹ️  Talent Scout not configured (set TALENT_SCOUT_CHANNEL and TALENT_SCOUT_SOURCES to enable)");
   }
+
+  // Run profile image enrichment in the background (2 min after boot)
+  setTimeout(() => {
+    enrichProfileImages().catch((err) => console.warn("📸 Image enrichment error:", err.message));
+  }, 2 * 60 * 1000);
 })();
