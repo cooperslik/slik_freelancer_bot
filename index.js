@@ -823,6 +823,35 @@ async function fetchGoogleDocContent(docId) {
       ? response.data.trim()
       : String(response.data).trim();
   } catch (error) {
+    // If it's a DOCX/uploaded file (not a native Google Doc), export won't work
+    // Fall back to downloading the raw file and extracting text
+    if (error.message && error.message.includes("Export only supports Docs Editors files")) {
+      console.log(`📄 Doc ${docId} is not a native Google Doc (likely DOCX) — downloading raw file...`);
+      try {
+        const fileRes = await drive.files.get(
+          { fileId: docId, alt: "media" },
+          { responseType: "arraybuffer" }
+        );
+        const buffer = Buffer.from(fileRes.data);
+        // Try DOCX extraction first (most likely for .docx files opened in Google Docs)
+        const docxText = await extractDocxText(buffer);
+        if (docxText) {
+          console.log(`📄 Extracted ${docxText.length} chars from DOCX via Drive download`);
+          return docxText;
+        }
+        // Try PDF extraction as fallback
+        const pdfText = await extractPdfText(buffer);
+        if (pdfText) {
+          console.log(`📄 Extracted ${pdfText.length} chars from PDF via Drive download`);
+          return pdfText;
+        }
+        console.warn(`📄 Could not extract text from downloaded file ${docId}`);
+        return null;
+      } catch (dlError) {
+        console.error(`📄 Drive download fallback failed (${docId}):`, dlError.message);
+        return null;
+      }
+    }
     console.error(`Google Doc fetch error (${docId}):`, error.message);
     return null;
   }
