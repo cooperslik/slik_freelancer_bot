@@ -38,6 +38,11 @@ const SUBMISSIONS_SPREADSHEET_ID = process.env.GOOGLE_SUBMISSIONS_SPREADSHEET_ID
 const SUBMISSIONS_NOTIFY_CHANNEL = process.env.SUBMISSIONS_NOTIFY_CHANNEL || null;
 const STREAMTIME_API_KEY = process.env.STREAMTIME_API_KEY || null;
 const STREAMTIME_API_BASE = "https://api.streamtime.net/v1";
+const TALENT_SCOUT_CHANNEL = process.env.TALENT_SCOUT_CHANNEL || null;
+// Comma-separated list of directory URLs to scrape for talent
+const TALENT_SCOUT_SOURCES = process.env.TALENT_SCOUT_SOURCES
+  ? process.env.TALENT_SCOUT_SOURCES.split(",").map((s) => s.trim())
+  : [];
 
 // ── Claude API with retry on rate limit ─────────────────────────────
 
@@ -2266,6 +2271,499 @@ slack.action("reject_submission", async ({ body, ack }) => {
   console.log(`❌ Submission rejected by ${rejectedBy}`);
 });
 
+// ── Talent Scout — weekly scrape of freelancer directories ───────────
+
+const TALENT_SCOUT_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+const seenTalentNames = new Set(); // In-memory dedup — persisted via Google Sheet tab
+
+// Scrape a single directory page for freelancer profile links and basic info
+async function scrapeDirectory(url) {
+  console.log(`🔍 Talent Scout: scraping ${url}...`);
+  const profiles = [];
+
+  try {
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-AU,en;q=0.9",
+      },
+    });
+
+    if (!res.ok) {
+      console.warn(`🔍 Talent Scout: ${url} returned ${res.status}`);
+      return profiles;
+    }
+
+    const html = await res.text();
+    const $ = cheerio.load(html);
+
+    // ── NodePro-specific parsing ──
+    if (url.includes("nodepro.com.au")) {
+      // NodePro lists artists in card/grid format with links to /artist/...
+      $('a[href*="/artist/"]').each((_, el) => {
+        const $el = $(el);
+        const href = $el.attr("href") || "";
+        const fullUrl = href.startsWith("http") ? href : `https://nodepro.com.au${href}`;
+
+        // Try to extract name and role from the card
+        const name = $el.find("h2, h3, .name, [class*='name']").first().text().trim()
+          || $el.text().trim().split("\n")[0]?.trim();
+        const role = $el.find(".role, [class*='role'], [class*='title'], p").first().text().trim() || "";
+        const location = $el.find(".location, [class*='location']").first().text().trim() || "";
+
+        if (name && name.length > 1 && name.length < 60) {
+          profiles.push({
+            name,
+            role,
+            location,
+            profileUrl: fullUrl,
+            source: "NodePro",
+          });
+        }
+      });
+    } else {
+      // ── Generic directory parsing ──
+      // Look for common patterns: cards with names, links, roles
+      $("a[href]").each((_, el) => {
+        const $el = $(el);
+        const href = $el.attr("href") || "";
+        const text = $el.text().trim();
+
+        // Heuristic: links that look like profile pages (contain "profile", "artist", "talent", "member", "person")
+        if (/\/(profile|artist|talent|member|person|freelancer)\//i.test(href) && text.length > 1 && text.length < 60) {
+          const fullUrl = href.startsWith("http") ? href : new URL(href, url).href;
+          profiles.push({
+            name: text.split("\n")[0]?.trim() || text,
+            role: "",
+            location: "",
+            profileUrl: fullUrl,
+            source: new URL(url).hostname.replace("www.", ""),
+          });
+        }
+      });
+    }
+
+    // Deduplicate by profile URL
+    const seen = new Set();
+    const unique = profiles.filter((p) => {
+      if (seen.has(p.profileUrl)) return false;
+      seen.add(p.profileUrl);
+      return true;
+    });
+
+    console.log(`🔍 Talent Scout: found ${unique.length} profiles on ${url}`);
+    return unique;
+  } catch (err) {
+    console.warn(`🔍 Talent Scout: error scraping ${url}:`, err.message);
+    return profiles;
+  }
+}
+
+// Scrape an individual profile page for more detail
+async function scrapeProfile(profileUrl) {
+  try {
+    const res = await fetch(profileUrl, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-AU,en;q=0.9",
+      },
+    });
+
+    if (!res.ok) return null;
+
+    const html = await res.text();
+    const $ = cheerio.load(html);
+
+    // Extract common profile fields
+    const title = $("title").text().trim();
+    const metaDesc = $('meta[name="description"]').attr("content") || "";
+    const ogDesc = $('meta[property="og:description"]').attr("content") || "";
+
+    // Pull all visible text from the main content area
+    $("script, style, nav, footer, header").remove();
+    const bodyText = $("body").text().replace(/\s+/g, " ").trim().substring(0, 3000);
+
+    return {
+      title,
+      description: ogDesc || metaDesc,
+      bodyText,
+    };
+  } catch (err) {
+    return null;
+  }
+}
+
+// Load previously seen talent from Google Sheet to avoid re-posting
+async function loadSeenTalent() {
+  try {
+    const { data } = await sheets.spreadsheets.values.get({
+      spreadsheetId: SPREADSHEET_ID,
+      range: "'Talent Scout Log'!A:B",
+    });
+    const rows = data.values || [];
+    for (const row of rows) {
+      if (row[0]) seenTalentNames.add(normalizeName(row[0]));
+    }
+    console.log(`🔍 Talent Scout: ${seenTalentNames.size} previously seen profiles loaded`);
+  } catch (err) {
+    // Tab doesn't exist yet — that's fine, will be created on first run
+    if (err.message?.includes("Unable to parse range")) {
+      console.log("🔍 Talent Scout: no log sheet yet — will create on first find");
+    } else {
+      console.warn("🔍 Talent Scout: could not load seen log:", err.message);
+    }
+  }
+}
+
+// Record a talent as "seen" in the Google Sheet log
+async function markTalentSeen(name, profileUrl) {
+  seenTalentNames.add(normalizeName(name));
+  try {
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: SPREADSHEET_ID,
+      range: "'Talent Scout Log'!A1",
+      valueInputOption: "RAW",
+      insertDataOption: "INSERT_ROWS",
+      requestBody: {
+        values: [[name, profileUrl, new Date().toISOString()]],
+      },
+    });
+  } catch (err) {
+    // If the tab doesn't exist, create it
+    if (err.message?.includes("Unable to parse range")) {
+      try {
+        const spreadsheet = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
+        await sheets.spreadsheets.batchUpdate({
+          spreadsheetId: SPREADSHEET_ID,
+          requestBody: {
+            requests: [{
+              addSheet: { properties: { title: "Talent Scout Log" } },
+            }],
+          },
+        });
+        // Add headers and this row
+        await sheets.spreadsheets.values.update({
+          spreadsheetId: SPREADSHEET_ID,
+          range: "'Talent Scout Log'!A1:C2",
+          valueInputOption: "RAW",
+          requestBody: {
+            values: [
+              ["Name", "Profile URL", "Date Found"],
+              [name, profileUrl, new Date().toISOString()],
+            ],
+          },
+        });
+      } catch (createErr) {
+        console.warn("🔍 Talent Scout: could not create log sheet:", createErr.message);
+      }
+    }
+  }
+}
+
+// Check if a talent is already in our roster
+function isInRoster(name, roster) {
+  const normalized = normalizeName(name);
+  return (roster || []).some((p) => p.Name && normalizeName(p.Name) === normalized);
+}
+
+// Main talent scout function
+async function runTalentScout() {
+  if (!TALENT_SCOUT_CHANNEL || TALENT_SCOUT_SOURCES.length === 0) return;
+
+  console.log("🔍 Talent Scout: starting weekly scan...");
+
+  try {
+    // Load roster for deduplication
+    const roster = await fetchAllFreelancers();
+
+    // Load seen list from Google Sheet
+    await loadSeenTalent();
+
+    // Scrape all configured sources
+    const allProfiles = [];
+    for (const sourceUrl of TALENT_SCOUT_SOURCES) {
+      const profiles = await scrapeDirectory(sourceUrl);
+      allProfiles.push(...profiles);
+      // Be polite — wait between sites
+      if (TALENT_SCOUT_SOURCES.length > 1) {
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+    }
+
+    if (allProfiles.length === 0) {
+      console.log("🔍 Talent Scout: no profiles found across all sources");
+      return;
+    }
+
+    // Filter out people already in roster or already seen
+    const newProfiles = allProfiles.filter((p) => {
+      if (isInRoster(p.name, roster)) return false;
+      if (seenTalentNames.has(normalizeName(p.name))) return false;
+      return true;
+    });
+
+    console.log(`🔍 Talent Scout: ${newProfiles.length} new profiles (${allProfiles.length} total, ${allProfiles.length - newProfiles.length} already known)`);
+
+    if (newProfiles.length === 0) {
+      console.log("🔍 Talent Scout: no new talent this week");
+      return;
+    }
+
+    // Limit to top 10 per week to avoid spamming
+    const batch = newProfiles.slice(0, 10);
+
+    // Scrape each profile for more detail, then use Claude to summarise
+    const enriched = [];
+    for (const profile of batch) {
+      const detail = await scrapeProfile(profile.profileUrl);
+      // Small delay between profile fetches
+      await new Promise((r) => setTimeout(r, 1000));
+
+      if (detail) {
+        // Use Claude to summarise the profile and extract key info
+        try {
+          const aiResponse = await claudeCreate({
+            model: "claude-sonnet-4-20250514",
+            max_tokens: 500,
+            messages: [{
+              role: "user",
+              content: `Summarise this freelancer's profile in 2-3 sentences for a creative agency. Extract their specialty/discipline (e.g. "Motion Designer", "Art Director"), location, and notable skills or clients. Keep it concise and useful for someone deciding whether to reach out.
+
+Name: ${profile.name}
+Profile URL: ${profile.profileUrl}
+Role from listing: ${profile.role || "Unknown"}
+Location from listing: ${profile.location || "Unknown"}
+
+Profile page content:
+${detail.title ? `Title: ${detail.title}` : ""}
+${detail.description ? `Description: ${detail.description}` : ""}
+${detail.bodyText ? `Page content: ${detail.bodyText.substring(0, 2000)}` : ""}
+
+Reply in this exact format:
+DISCIPLINE: [their main discipline]
+LOCATION: [city, country]
+SUMMARY: [2-3 sentence summary]`,
+            }],
+          });
+
+          const aiText = aiResponse.content[0].text;
+          const discipline = aiText.match(/DISCIPLINE:\s*(.+)/i)?.[1]?.trim() || profile.role || "Creative";
+          const location = aiText.match(/LOCATION:\s*(.+)/i)?.[1]?.trim() || profile.location || "";
+          const summary = aiText.match(/SUMMARY:\s*([\s\S]+)/i)?.[1]?.trim() || "";
+
+          enriched.push({
+            ...profile,
+            discipline,
+            location: location || profile.location,
+            summary,
+          });
+        } catch (aiErr) {
+          // If Claude fails, still include with basic info
+          enriched.push({
+            ...profile,
+            discipline: profile.role || "Creative",
+            summary: "",
+          });
+        }
+      } else {
+        enriched.push({
+          ...profile,
+          discipline: profile.role || "Creative",
+          summary: "",
+        });
+      }
+    }
+
+    // Post digest header
+    await slack.client.chat.postMessage({
+      channel: TALENT_SCOUT_CHANNEL,
+      text: `🔍 Weekly Talent Scout — ${enriched.length} new find${enriched.length === 1 ? "" : "s"}`,
+      blocks: [
+        {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text: `🔍 *Weekly Talent Scout — ${enriched.length} new find${enriched.length === 1 ? "" : "s"}*\nScanned ${TALENT_SCOUT_SOURCES.length} director${TALENT_SCOUT_SOURCES.length === 1 ? "y" : "ies"} · ${allProfiles.length} total profiles · ${newProfiles.length} new`,
+          },
+        },
+        { type: "divider" },
+      ],
+    });
+
+    // Post each profile as a separate message with Add/Pass buttons
+    for (const profile of enriched) {
+      let text = `*${profile.name}*`;
+      if (profile.discipline) text += ` — ${profile.discipline}`;
+      text += `\n`;
+      if (profile.location) text += `📍 ${profile.location}\n`;
+      if (profile.summary) text += `💬 _${profile.summary}_\n`;
+      text += `🔗 <${profile.profileUrl}|View Profile> · Source: ${profile.source}`;
+
+      await slack.client.chat.postMessage({
+        channel: TALENT_SCOUT_CHANNEL,
+        text: `🔍 New talent: ${profile.name}`,
+        blocks: [
+          {
+            type: "section",
+            text: { type: "mrkdwn", text },
+          },
+          {
+            type: "actions",
+            elements: [
+              {
+                type: "button",
+                text: { type: "plain_text", text: "✅ Add to Roster" },
+                style: "primary",
+                action_id: "approve_scout",
+                value: JSON.stringify({
+                  name: profile.name,
+                  category: profile.discipline,
+                  portfolio: profile.profileUrl,
+                  location: profile.location || "",
+                  about: profile.summary || "",
+                  source: profile.source,
+                }),
+              },
+              {
+                type: "button",
+                text: { type: "plain_text", text: "❌ Pass" },
+                style: "danger",
+                action_id: "reject_scout",
+              },
+            ],
+          },
+        ],
+      });
+
+      // Mark as seen
+      await markTalentSeen(profile.name, profile.profileUrl);
+
+      // Small delay between posts
+      await new Promise((r) => setTimeout(r, 500));
+    }
+
+    console.log(`🔍 Talent Scout: posted ${enriched.length} new profiles to Slack`);
+  } catch (err) {
+    console.warn("🔍 Talent Scout error:", err.message);
+  }
+}
+
+// ── Talent Scout button handlers ──────────────────────────────────────
+
+slack.action("approve_scout", async ({ body, ack }) => {
+  await ack();
+
+  const messageTs = body.message.ts;
+  const channel = body.channel.id;
+  const approvedBy = body.user.name || body.user.id;
+
+  let profile;
+  try {
+    profile = JSON.parse(body.actions[0].value);
+  } catch (e) {
+    profile = null;
+  }
+
+  if (!profile) {
+    await slack.client.chat.postMessage({
+      channel,
+      thread_ts: messageTs,
+      text: "⚠️ Couldn't read the profile data. You'll need to add them manually.",
+    });
+    return;
+  }
+
+  console.log(`✅ Scout: "${profile.name}" approved by ${approvedBy} — adding to roster...`);
+
+  try {
+    const tabName = resolveTab(profile.category);
+
+    const { data } = await sheets.spreadsheets.values.get({
+      spreadsheetId: SPREADSHEET_ID,
+      range: `'${tabName}'!A2:Z2`,
+    });
+
+    const headers = (data.values?.[0] || []).map((h) => h.trim());
+    if (headers.length === 0) {
+      console.error(`❌ No headers found in tab "${tabName}" row 2`);
+      return;
+    }
+
+    const newRow = headers.map((header) => {
+      const h = header.toLowerCase();
+      if (h === "name") return profile.name;
+      if (h === "availibility" || h === "availability") return "Available";
+      if (h === "capabilites" || h === "capabilities") return profile.category || "";
+      if (h === "portfolio") return profile.portfolio || "";
+      if (h === "location") return profile.location || "";
+      if (h === "comments") return profile.about
+        ? `[Talent Scout - ${profile.source}] ${profile.about}`
+        : `[Found via Talent Scout - ${profile.source}]`;
+      if (h === "status") return "New";
+      return "";
+    });
+
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: SPREADSHEET_ID,
+      range: `'${tabName}'!A3`,
+      valueInputOption: "RAW",
+      insertDataOption: "INSERT_ROWS",
+      requestBody: { values: [newRow] },
+    });
+
+    console.log(`✅ Scout: "${profile.name}" added to "${tabName}" tab`);
+    rosterCache = null;
+    cacheTimestamp = 0;
+
+    const originalBlocks = body.message.blocks || [];
+    const updatedBlocks = originalBlocks.filter((b) => b.type !== "actions");
+    updatedBlocks.push({
+      type: "section",
+      text: { type: "mrkdwn", text: `✅ *Added to ${tabName}* by ${approvedBy}` },
+    });
+
+    await slack.client.chat.update({
+      channel,
+      ts: messageTs,
+      blocks: updatedBlocks,
+      text: `✅ ${profile.name} added to ${tabName} by ${approvedBy}`,
+    });
+  } catch (error) {
+    console.error(`❌ Scout: failed to add "${profile.name}":`, error.message);
+    await slack.client.chat.postMessage({
+      channel,
+      thread_ts: messageTs,
+      text: `⚠️ Couldn't add *${profile.name}* to the roster. Error: ${error.message}`,
+    });
+  }
+});
+
+slack.action("reject_scout", async ({ body, ack }) => {
+  await ack();
+
+  const messageTs = body.message.ts;
+  const channel = body.channel.id;
+  const rejectedBy = body.user.name || body.user.id;
+
+  const originalBlocks = body.message.blocks || [];
+  const updatedBlocks = originalBlocks.filter((b) => b.type !== "actions");
+  updatedBlocks.push({
+    type: "section",
+    text: { type: "mrkdwn", text: `❌ *Passed* by ${rejectedBy}` },
+  });
+
+  await slack.client.chat.update({
+    channel,
+    ts: messageTs,
+    blocks: updatedBlocks,
+    text: `❌ Passed by ${rejectedBy}`,
+  });
+
+  console.log(`❌ Scout: talent passed by ${rejectedBy}`);
+});
+
 // ── Start the bot ────────────────────────────────────────────────────
 
 // ── Auto-detect actual tab names from the spreadsheet ─────────────────
@@ -2345,5 +2843,17 @@ async function syncTabNames() {
     setInterval(checkForNewSubmissions, SUBMISSION_POLL_INTERVAL_MS);
   } else {
     console.log("ℹ️  Submission watcher not configured (set GOOGLE_SUBMISSIONS_SPREADSHEET_ID and SUBMISSIONS_NOTIFY_CHANNEL to enable)");
+  }
+  if (TALENT_SCOUT_CHANNEL && TALENT_SCOUT_SOURCES.length > 0) {
+    console.log(`🔍 Talent Scout active — scanning ${TALENT_SCOUT_SOURCES.length} source(s) weekly`);
+    console.log(`🔍 Sources: ${TALENT_SCOUT_SOURCES.join(", ")}`);
+    // Run first scan shortly after boot (10s for testing — change to 5*60*1000 for production)
+    setTimeout(() => {
+      runTalentScout();
+      // Then run weekly
+      setInterval(runTalentScout, TALENT_SCOUT_INTERVAL_MS);
+    }, 10 * 1000);
+  } else {
+    console.log("ℹ️  Talent Scout not configured (set TALENT_SCOUT_CHANNEL and TALENT_SCOUT_SOURCES to enable)");
   }
 })();
