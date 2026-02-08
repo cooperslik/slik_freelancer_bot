@@ -1215,8 +1215,8 @@ async function enrichWithPortfolios(names, roster) {
     );
     if (person) {
       const portfolioUrl = person.Portfolio || "";
-      // "Photo" column in the sheet overrides og:image (direct link to a headshot)
-      const manualPhoto = person.Photo || person["Photo URL"] || "";
+      // "Profile Image" column in the sheet overrides scraped image (direct link to a headshot)
+      const manualPhoto = person["Profile Image"] || person["Profile Image URL"] || person["Image"] || person.Photo || person["Photo URL"] || "";
       matches.push({ name: person.Name, url: portfolioUrl, manualPhoto: manualPhoto.trim() });
     }
   }
@@ -2026,17 +2026,31 @@ slack.event("app_mention", async ({ event, say }) => {
       text: reply,
     });
 
-    // Portfolio text enrichment in the background (fire-and-forget)
+    // Portfolio + image enrichment in the background (fire-and-forget)
     const recommendedNames = extractNamesFromReply(reply);
     if (recommendedNames.length > 0) {
       (async () => {
         try {
           const enrichment = await enrichRecommendations(recommendedNames, roster);
+
+          // Update the main message with portfolio insights text
           if (enrichment.text) {
             await slack.client.chat.update({
               channel: event.channel,
               ts: thinking.ts,
               text: reply + enrichment.text,
+            });
+          }
+
+          // Post profile images as a follow-up message in the thread
+          // (chat.update with blocks returns 500, so we use a new message)
+          const followUpBlocks = buildFollowUpBlocks(enrichment.images, "");
+          if (followUpBlocks.length > 0) {
+            await slack.client.chat.postMessage({
+              channel: event.channel,
+              thread_ts: event.ts,
+              blocks: followUpBlocks,
+              text: "📷 Profile photos for recommended freelancers",
             });
           }
         } catch (e) {
@@ -2114,17 +2128,30 @@ slack.event("message", async ({ event, say }) => {
       text: reply,
     });
 
-    // Portfolio text enrichment in the background (fire-and-forget)
+    // Portfolio + image enrichment in the background (fire-and-forget)
     const recommendedNames = extractNamesFromReply(reply);
     if (recommendedNames.length > 0) {
       (async () => {
         try {
           const enrichment = await enrichRecommendations(recommendedNames, roster);
+
+          // Update the main message with portfolio insights text
           if (enrichment.text) {
             await slack.client.chat.update({
               channel: event.channel,
               ts: thinking.ts,
               text: reply + enrichment.text,
+            });
+          }
+
+          // Post profile images as a follow-up message
+          const followUpBlocks = buildFollowUpBlocks(enrichment.images, "");
+          if (followUpBlocks.length > 0) {
+            await slack.client.chat.postMessage({
+              channel: event.channel,
+              thread_ts: thinking.ts,
+              blocks: followUpBlocks,
+              text: "📷 Profile photos for recommended freelancers",
             });
           }
         } catch (e) {
