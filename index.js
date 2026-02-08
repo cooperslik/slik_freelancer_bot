@@ -1699,6 +1699,17 @@ slack.event("app_mention", async ({ event, say }) => {
   const wasReview = await handleReview(query, say, threadTs, event.channel);
   if (wasReview) return;
 
+  // Check if this is a talent scout trigger
+  if (/^(scout|scan\s*talent|talent\s*scout|find\s*talent|scrape)/i.test(query)) {
+    if (!TALENT_SCOUT_CHANNEL || TALENT_SCOUT_SOURCES.length === 0) {
+      await say({ text: "⚠️ Talent Scout isn't configured yet. Set `TALENT_SCOUT_CHANNEL` and `TALENT_SCOUT_SOURCES` in Railway.", thread_ts: threadTs });
+      return;
+    }
+    await say({ text: "🔍 Running talent scout now — results will appear in the talent scouting channel shortly...", thread_ts: threadTs });
+    runTalentScout().catch((err) => console.warn("🔍 Manual scout error:", err.message));
+    return;
+  }
+
   // Show a thinking indicator
   const thinking = await say({
     text: "🔍 Checking the team and freelancer roster...",
@@ -2374,32 +2385,56 @@ async function scrapeDirectory(url) {
   }
 }
 
-// Scrape an individual profile page for more detail
-async function scrapeProfile(profileUrl) {
-  let browser;
+// Scrape an individual profile page for more detail (reuses an existing browser)
+async function scrapeProfile(profileUrl, browser) {
+  let page;
   try {
-    browser = await launchBrowser();
-    const page = await browser.newPage();
-    await page.goto(profileUrl, { waitUntil: "networkidle2", timeout: 20000 });
-    await new Promise((r) => setTimeout(r, 2000));
+    page = browser ? await browser.newPage() : null;
+    if (!page) return null;
+    await page.goto(profileUrl, { waitUntil: "networkidle2", timeout: 15000 });
+    await new Promise((r) => setTimeout(r, 1500));
 
     const data = await page.evaluate(() => {
       const title = document.title || "";
       const metaDesc = document.querySelector('meta[name="description"]')?.content || "";
       const ogDesc = document.querySelector('meta[property="og:description"]')?.content || "";
+      const ogImage = document.querySelector('meta[property="og:image"]')?.content || "";
+
+      // Try to find a profile/avatar image if no og:image
+      let profileImage = ogImage;
+      if (!profileImage) {
+        // Look for common profile image patterns
+        const imgCandidates = [
+          document.querySelector('img[class*="avatar"]'),
+          document.querySelector('img[class*="profile"]'),
+          document.querySelector('img[class*="photo"]'),
+          document.querySelector('img[class*="headshot"]'),
+          document.querySelector('img[alt*="profile"]'),
+          document.querySelector('.profile img, .avatar img, .hero img'),
+          // NodePro uses large hero/feature images
+          document.querySelector('img[class*="hero"]'),
+          document.querySelector('img[class*="banner"]'),
+        ];
+        for (const img of imgCandidates) {
+          if (img && img.src && !img.src.includes("placeholder") && !img.src.includes("default")) {
+            profileImage = img.src;
+            break;
+          }
+        }
+      }
 
       // Remove noise
       document.querySelectorAll("script, style, nav, footer, header").forEach((el) => el.remove());
       const bodyText = document.body.innerText.replace(/\s+/g, " ").trim().substring(0, 3000);
 
-      return { title, description: ogDesc || metaDesc, bodyText };
+      return { title, description: ogDesc || metaDesc, bodyText, profileImage };
     });
 
     return data;
   } catch (err) {
     return null;
   } finally {
-    if (browser) await browser.close().catch(() => {});
+    if (page) await page.close().catch(() => {});
   }
 }
 
@@ -2523,11 +2558,19 @@ async function runTalentScout() {
     const batch = newProfiles.slice(0, 10);
 
     // Scrape each profile for more detail, then use Claude to summarise
+    // Use a single browser instance for all profile pages
+    console.log(`🔍 Talent Scout: enriching ${batch.length} profiles...`);
+    let profileBrowser;
+    try { profileBrowser = await launchBrowser(); } catch (e) {
+      console.warn("🔍 Talent Scout: could not launch browser for profiles:", e.message);
+    }
     const enriched = [];
-    for (const profile of batch) {
-      const detail = await scrapeProfile(profile.profileUrl);
+    for (let i = 0; i < batch.length; i++) {
+      const profile = batch[i];
+      console.log(`🔍 Talent Scout: scraping profile ${i + 1}/${batch.length}: ${profile.name}`);
+      const detail = await scrapeProfile(profile.profileUrl, profileBrowser);
       // Small delay between profile fetches
-      await new Promise((r) => setTimeout(r, 1000));
+      await new Promise((r) => setTimeout(r, 500));
 
       if (detail) {
         // Use Claude to summarise the profile and extract key info
@@ -2566,6 +2609,7 @@ SUMMARY: [2-3 sentence summary]`,
             discipline,
             location: location || profile.location,
             summary,
+            image: detail.profileImage || "",
           });
         } catch (aiErr) {
           // If Claude fails, still include with basic info
@@ -2573,6 +2617,7 @@ SUMMARY: [2-3 sentence summary]`,
             ...profile,
             discipline: profile.role || "Creative",
             summary: "",
+            image: detail.profileImage || "",
           });
         }
       } else {
@@ -2580,9 +2625,14 @@ SUMMARY: [2-3 sentence summary]`,
           ...profile,
           discipline: profile.role || "Creative",
           summary: "",
+          image: "",
         });
       }
     }
+
+    // Close the shared browser
+    if (profileBrowser) await profileBrowser.close().catch(() => {});
+    console.log(`🔍 Talent Scout: enrichment done — ${enriched.length} profiles ready to post`);
 
     // Post digest header
     await slack.client.chat.postMessage({
@@ -2609,14 +2659,24 @@ SUMMARY: [2-3 sentence summary]`,
       if (profile.summary) text += `💬 _${profile.summary}_\n`;
       text += `🔗 <${profile.profileUrl}|View Profile> · Source: ${profile.source}`;
 
+      // Build the profile section — with thumbnail if we have an image
+      const profileSection = {
+        type: "section",
+        text: { type: "mrkdwn", text },
+      };
+      if (profile.image) {
+        profileSection.accessory = {
+          type: "image",
+          image_url: profile.image,
+          alt_text: profile.name,
+        };
+      }
+
       await slack.client.chat.postMessage({
         channel: TALENT_SCOUT_CHANNEL,
         text: `🔍 New talent: ${profile.name}`,
         blocks: [
-          {
-            type: "section",
-            text: { type: "mrkdwn", text },
-          },
+          profileSection,
           {
             type: "actions",
             elements: [
@@ -2855,12 +2915,11 @@ async function syncTabNames() {
   if (TALENT_SCOUT_CHANNEL && TALENT_SCOUT_SOURCES.length > 0) {
     console.log(`🔍 Talent Scout active — scanning ${TALENT_SCOUT_SOURCES.length} source(s) weekly`);
     console.log(`🔍 Sources: ${TALENT_SCOUT_SOURCES.join(", ")}`);
-    // Run first scan shortly after boot (10s for testing — change to 5*60*1000 for production)
+    // Run first scan 5 min after boot, then weekly
     setTimeout(() => {
       runTalentScout();
-      // Then run weekly
       setInterval(runTalentScout, TALENT_SCOUT_INTERVAL_MS);
-    }, 10 * 1000);
+    }, 5 * 60 * 1000);
   } else {
     console.log("ℹ️  Talent Scout not configured (set TALENT_SCOUT_CHANNEL and TALENT_SCOUT_SOURCES to enable)");
   }
