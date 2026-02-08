@@ -2476,7 +2476,7 @@ async function runTalentScout() {
 
   try {
     // Load roster for deduplication
-    const roster = await fetchAllFreelancers();
+    const roster = await fetchRoster();
 
     // Load seen list from Google Sheet
     await loadSeenTalent();
