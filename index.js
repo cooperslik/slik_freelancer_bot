@@ -853,29 +853,49 @@ async function extractBriefContent(event) {
       const isDocx = mime === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" || name.endsWith(".docx");
       const isText = mime.startsWith("text/") || name.endsWith(".txt") || name.endsWith(".md");
 
-      if (isPdf) {
-        console.log(`📄 Downloading PDF: ${name} (${(file.size / 1024).toFixed(0)}KB)`);
+      if (isPdf || isDocx) {
+        console.log(`📄 Downloading ${isPdf ? "PDF" : "DOCX"}: ${name} (${(file.size / 1024).toFixed(0)}KB)`);
         const buffer = await downloadSlackFile(file.url_private);
+        let text = null;
         if (buffer) {
-          const text = await extractPdfText(buffer);
-          if (text) {
-            console.log(`📄 Extracted ${text.length} chars from ${name}`);
-            briefParts.push(`--- Brief: ${name} ---\n${text}`);
+          if (isPdf) {
+            // Try PDF extraction first
+            text = await extractPdfText(buffer);
+            // If PDF fails, check if it's actually a DOCX disguised as PDF
+            if (!text && buffer[0] === 0x50 && buffer[1] === 0x4B) {
+              console.log("📄 File is actually a ZIP/DOCX — trying DOCX extraction...");
+              text = await extractDocxText(buffer);
+            }
           } else {
-            console.warn(`📄 Could not extract text from ${name}`);
+            text = await extractDocxText(buffer);
           }
         }
-      } else if (isDocx) {
-        console.log(`📄 Downloading DOCX: ${name} (${(file.size / 1024).toFixed(0)}KB)`);
-        const buffer = await downloadSlackFile(file.url_private);
-        if (buffer) {
-          const text = await extractDocxText(buffer);
-          if (text) {
-            console.log(`📄 Extracted ${text.length} chars from ${name}`);
-            briefParts.push(`--- Brief: ${name} ---\n${text}`);
-          } else {
-            console.warn(`📄 Could not extract text from ${name}`);
+        // Fallback: use Slack's own plain_text preview if our extraction fails
+        if (!text) {
+          const slackPreview = file.plain_text || file.preview || "";
+          if (slackPreview.length > 50) {
+            console.log(`📄 Using Slack preview (${slackPreview.length} chars) for ${name}`);
+            text = slackPreview;
           }
+        }
+        // Last resort: fetch Slack's plain text conversion via files.info
+        if (!text) {
+          try {
+            const fileInfo = await slack.client.files.info({ file: file.id });
+            const content = fileInfo.content || fileInfo.file?.plain_text || fileInfo.file?.preview || "";
+            if (content.length > 50) {
+              console.log(`📄 Using Slack files.info content (${content.length} chars) for ${name}`);
+              text = content;
+            }
+          } catch (e) {
+            console.warn(`📄 files.info fallback failed: ${e.message}`);
+          }
+        }
+        if (text) {
+          console.log(`📄 ✅ Extracted ${text.length} chars from ${name}`);
+          briefParts.push(`--- Brief: ${name} ---\n${text}`);
+        } else {
+          console.warn(`📄 ❌ Could not extract text from ${name} — try uploading the original .docx or a text file instead`);
         }
       } else if (isText) {
         console.log(`📄 Downloading text file: ${name}`);
