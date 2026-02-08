@@ -1684,11 +1684,17 @@ slack.event("app_mention", async ({ event, say }) => {
     const streamtimeText = formatStreamtimeForPrompt(streamtime, roster, team);
     const allData = teamText + "\n" + rosterText + streamtimeText;
 
-    // Build the request text — include brief content if found
+    // Build the request text — include brief content if found (cap at 4000 chars to avoid rate limits)
     let requestText = query;
     if (briefContent) {
-      requestText = `${query}\n\n📄 ATTACHED BRIEF:\n${briefContent}`;
-      console.log(`📄 Brief attached (${briefContent.length} chars) — included in prompt`);
+      const MAX_BRIEF_CHARS = 4000;
+      let trimmedBrief = briefContent;
+      if (briefContent.length > MAX_BRIEF_CHARS) {
+        trimmedBrief = briefContent.substring(0, MAX_BRIEF_CHARS) + "\n\n[Brief truncated — full document was " + briefContent.length + " chars]";
+        console.log(`📄 Brief trimmed from ${briefContent.length} to ${MAX_BRIEF_CHARS} chars to stay within rate limits`);
+      }
+      requestText = `${query}\n\n📄 ATTACHED BRIEF:\n${trimmedBrief}`;
+      console.log(`📄 Brief attached (${trimmedBrief.length} chars) — included in prompt`);
     }
 
     // Check if this is a follow-up in an existing thread
