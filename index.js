@@ -1529,59 +1529,30 @@ slack.event("app_mention", async ({ event, say }) => {
     const reply =
       response.content?.[0]?.text || "No recommendation could be generated.";
 
-    // Try to enrich with portfolio images before sending (quick timeout)
+    // Send the recommendation immediately
+    await slack.client.chat.update({
+      channel: event.channel,
+      ts: thinking.ts,
+      text: reply,
+    });
+
+    // Portfolio text enrichment in the background (fire-and-forget)
     const recommendedNames = extractNamesFromReply(reply);
-    let blocks = null;
-    let enrichedText = reply;
-
     if (recommendedNames.length > 0) {
-      try {
-        // Race enrichment against a timeout — don't hold up the response too long
-        const enrichment = await Promise.race([
-          enrichRecommendations(recommendedNames, roster),
-          new Promise((resolve) => setTimeout(() => resolve(null), 10000)), // 10s max
-        ]);
-
-        if (enrichment && (enrichment.text || Object.keys(enrichment.images).length > 0)) {
-          enrichedText = reply + (enrichment.text || "");
-          blocks = buildSlackBlocks(reply, enrichment.images, enrichment.text);
-          if (blocks) {
-            console.log(`📸 Built ${blocks.length} blocks with ${Object.keys(enrichment.images).length} inline image(s)`);
+      (async () => {
+        try {
+          const enrichment = await enrichRecommendations(recommendedNames, roster);
+          if (enrichment.text) {
+            await slack.client.chat.update({
+              channel: event.channel,
+              ts: thinking.ts,
+              text: reply + enrichment.text,
+            });
           }
+        } catch (e) {
+          console.warn("Portfolio enrichment failed:", e.message);
         }
-      } catch (enrichError) {
-        console.error("📸 Enrichment error (sending text-only):", enrichError.message);
-      }
-    }
-
-    // Send the response — chat.update with blocks returns 500 on this workspace,
-    // so when we have blocks we post a NEW message and delete the thinking message.
-    if (blocks) {
-      try {
-        await slack.client.chat.postMessage({
-          channel: event.channel,
-          thread_ts: threadTs,
-          text: enrichedText,
-          blocks,
-        });
-        // Clean up the thinking message
-        try { await slack.client.chat.delete({ channel: event.channel, ts: thinking.ts }); } catch (e) { /* OK if delete fails */ }
-        console.log("📸 ✅ Sent response with inline images (postMessage)");
-      } catch (postError) {
-        console.error("📸 ❌ Block postMessage failed, falling back to text:", postError.message);
-        await slack.client.chat.update({
-          channel: event.channel,
-          ts: thinking.ts,
-          text: enrichedText,
-        });
-      }
-    } else {
-      await slack.client.chat.update({
-        channel: event.channel,
-        ts: thinking.ts,
-        text: enrichedText,
-      });
-      console.log("📸 Sent text-only response (no images available)");
+      })();
     }
   } catch (error) {
     console.error("Error processing request:", error);
@@ -1639,56 +1610,30 @@ slack.event("message", async ({ event, say }) => {
     const reply =
       response.content?.[0]?.text || "No recommendation could be generated.";
 
-    // Try to enrich with portfolio images before sending (quick timeout)
+    // Send the recommendation immediately
+    await slack.client.chat.update({
+      channel: event.channel,
+      ts: thinking.ts,
+      text: reply,
+    });
+
+    // Portfolio text enrichment in the background (fire-and-forget)
     const recommendedNames = extractNamesFromReply(reply);
-    let blocks = null;
-    let enrichedText = reply;
-
     if (recommendedNames.length > 0) {
-      try {
-        const enrichment = await Promise.race([
-          enrichRecommendations(recommendedNames, roster),
-          new Promise((resolve) => setTimeout(() => resolve(null), 10000)),
-        ]);
-
-        if (enrichment && (enrichment.text || Object.keys(enrichment.images).length > 0)) {
-          enrichedText = reply + (enrichment.text || "");
-          blocks = buildSlackBlocks(reply, enrichment.images, enrichment.text);
-          if (blocks) {
-            console.log(`📸 [DM] Built ${blocks.length} blocks with ${Object.keys(enrichment.images).length} inline image(s)`);
+      (async () => {
+        try {
+          const enrichment = await enrichRecommendations(recommendedNames, roster);
+          if (enrichment.text) {
+            await slack.client.chat.update({
+              channel: event.channel,
+              ts: thinking.ts,
+              text: reply + enrichment.text,
+            });
           }
+        } catch (e) {
+          console.warn("Portfolio enrichment failed:", e.message);
         }
-      } catch (enrichError) {
-        console.error("📸 [DM] Enrichment error (sending text-only):", enrichError.message);
-      }
-    }
-
-    // Send the response — use postMessage for blocks (chat.update + blocks = 500)
-    if (blocks) {
-      try {
-        await slack.client.chat.postMessage({
-          channel: event.channel,
-          thread_ts: thinking.ts,
-          text: enrichedText,
-          blocks,
-        });
-        try { await slack.client.chat.delete({ channel: event.channel, ts: thinking.ts }); } catch (e) { /* OK if delete fails */ }
-        console.log("📸 [DM] ✅ Sent response with inline images (postMessage)");
-      } catch (postError) {
-        console.error("📸 [DM] ❌ Block postMessage failed, falling back to text:", postError.message);
-        await slack.client.chat.update({
-          channel: event.channel,
-          ts: thinking.ts,
-          text: enrichedText,
-        });
-      }
-    } else {
-      await slack.client.chat.update({
-        channel: event.channel,
-        ts: thinking.ts,
-        text: enrichedText,
-      });
-      console.log("📸 [DM] Sent text-only response");
+      })();
     }
   } catch (error) {
     console.error("Error processing DM:", error);
