@@ -977,7 +977,7 @@ function stripHtmlToText(html) {
   return $("body").text().replace(/\s+/g, " ").trim();
 }
 
-async function scrapePortfolio(portfolioUrl) {
+async function scrapePortfolio(portfolioUrl, personName) {
   if (!portfolioUrl) return null;
 
   // Clean and validate the URL
@@ -1022,29 +1022,140 @@ async function scrapePortfolio(portfolioUrl) {
     }
 
     const html = await response.text();
-
-    // Extract og:image / twitter:image for profile thumbnail
     const $ = cheerio.load(html);
-    let imageUrl =
-      $('meta[property="og:image"]').attr("content") ||
-      $('meta[name="og:image"]').attr("content") ||
-      $('meta[property="twitter:image"]').attr("content") ||
-      $('meta[name="twitter:image"]').attr("content") ||
-      "";
-    // Resolve relative URLs
-    if (imageUrl && !imageUrl.startsWith("http")) {
-      try {
-        imageUrl = new URL(imageUrl, url).href;
-      } catch (e) {
-        imageUrl = "";
+
+    // ── Smart profile image finder ─────────────────────────────────
+    // Score all images on the page to find the most likely headshot.
+    // Priority: filename/alt/class keywords > og:image as last resort.
+
+    // Build name fragments for matching (e.g. "John Smith" → ["john", "smith"])
+    const nameFragments = personName
+      ? personName.toLowerCase().split(/[\s\-]+/).filter((w) => w.length > 2)
+      : [];
+
+    // Keywords that strongly suggest a headshot/profile pic
+    const headshotKeywords = [
+      "profile", "avatar", "headshot", "head-shot", "portrait",
+      "author", "bio", "about-me", "aboutme", "mugshot", "selfie",
+      "team-photo", "staff", "person", "face", "photo-of",
+    ];
+
+    // Keywords that suggest it's NOT a profile pic
+    const excludeKeywords = [
+      "logo", "favicon", "icon", "banner", "hero", "bg", "background",
+      "pattern", "texture", "sprite", "placeholder", "default", "og-default",
+      "loading", "spinner", "arrow", "chevron", "badge", "social",
+      "facebook", "twitter", "instagram", "linkedin", "youtube",
+      "client", "brand", "award", "certificate",
+    ];
+
+    // Collect all candidate images with scores
+    const candidates = [];
+
+    $("img").each((_, el) => {
+      const src = $(el).attr("src") || "";
+      const alt = ($(el).attr("alt") || "").toLowerCase();
+      const className = ($(el).attr("class") || "").toLowerCase();
+      const id = ($(el).attr("id") || "").toLowerCase();
+      const parentClass = ($(el).parent().attr("class") || "").toLowerCase();
+      const parentId = ($(el).parent().attr("id") || "").toLowerCase();
+
+      if (!src) return;
+
+      // Resolve to absolute URL
+      let absoluteSrc = src;
+      if (!absoluteSrc.startsWith("http")) {
+        try { absoluteSrc = new URL(absoluteSrc, url).href; } catch (e) { return; }
       }
+
+      const srcLower = absoluteSrc.toLowerCase();
+      const allText = `${srcLower} ${alt} ${className} ${id} ${parentClass} ${parentId}`;
+
+      // Skip tiny images (tracking pixels, icons) and SVGs
+      if (srcLower.endsWith(".svg") || srcLower.includes("1x1") || srcLower.includes("pixel")) return;
+      // Skip excluded keywords
+      if (excludeKeywords.some((kw) => allText.includes(kw))) return;
+
+      let score = 0;
+
+      // Strong signal: filename or alt/class contains headshot keywords
+      for (const kw of headshotKeywords) {
+        if (srcLower.includes(kw)) score += 10;
+        if (alt.includes(kw)) score += 8;
+        if (className.includes(kw) || id.includes(kw)) score += 6;
+        if (parentClass.includes(kw) || parentId.includes(kw)) score += 4;
+      }
+
+      // Strong signal: filename or alt contains the person's name
+      for (const frag of nameFragments) {
+        if (srcLower.includes(frag)) score += 12;
+        if (alt.includes(frag)) score += 10;
+      }
+
+      // Medium signal: round/circle styling (common for headshots)
+      if (allText.includes("rounded-full") || allText.includes("border-radius") ||
+          allText.includes("circle") || allText.includes("round")) {
+        score += 5;
+      }
+
+      // Medium signal: image is in an "about" or "bio" section
+      // Walk up a few parent levels to check
+      let parent = $(el).parent();
+      for (let depth = 0; depth < 4; depth++) {
+        const pClass = (parent.attr("class") || "").toLowerCase();
+        const pId = (parent.attr("id") || "").toLowerCase();
+        const pTag = (parent.prop("tagName") || "").toLowerCase();
+        if (pClass.includes("about") || pId.includes("about") ||
+            pClass.includes("bio") || pId.includes("bio") ||
+            pClass.includes("team") || pId.includes("team") ||
+            pClass.includes("author") || pId.includes("author")) {
+          score += 6;
+          break;
+        }
+        parent = parent.parent();
+        if (!parent.length) break;
+      }
+
+      // Slight signal: common headshot image extensions & sizes
+      if (srcLower.match(/\.(jpg|jpeg|png|webp)/)) score += 1;
+      // object-cover + contained size classes often indicate headshots
+      if (className.includes("object-cover")) score += 3;
+
+      if (score > 0) {
+        candidates.push({ src: absoluteSrc, score, alt, debug: allText.substring(0, 100) });
+      }
+    });
+
+    // Sort by score descending, pick the best
+    candidates.sort((a, b) => b.score - a.score);
+
+    let imageUrl = null;
+
+    if (candidates.length > 0 && candidates[0].score >= 4) {
+      // Use the highest-scoring image if it has a meaningful score
+      imageUrl = candidates[0].src;
+      console.log(`📸 ${url}: found headshot (score=${candidates[0].score}): ${imageUrl}`);
+      if (candidates.length > 1) {
+        console.log(`📸   runners-up: ${candidates.slice(1, 3).map((c) => `score=${c.score} ${c.src.substring(c.src.lastIndexOf("/") + 1).substring(0, 40)}`).join(", ")}`);
+      }
+    } else {
+      // Fall back to og:image only if no good headshot candidate found
+      const ogImage =
+        $('meta[property="og:image"]').attr("content") ||
+        $('meta[name="og:image"]').attr("content") ||
+        $('meta[property="twitter:image"]').attr("content") ||
+        $('meta[name="twitter:image"]').attr("content") ||
+        "";
+      if (ogImage) {
+        try { imageUrl = new URL(ogImage.trim(), url).href; } catch (e) { imageUrl = null; }
+      }
+      console.log(`📸 ${url}: no headshot found in page images, og:image fallback=${imageUrl || "none"}`);
     }
-    imageUrl = imageUrl.trim() || null;
-    // Slack blocks require HTTPS — upgrade HTTP image URLs
+
+    // Ensure HTTPS for Slack
     if (imageUrl && imageUrl.startsWith("http://")) {
       imageUrl = imageUrl.replace("http://", "https://");
     }
-    console.log(`📸 ${url}: og:image=${imageUrl || "none"}`);
 
     let pageText = stripHtmlToText(html);
 
@@ -1122,7 +1233,7 @@ async function enrichWithPortfolios(names, roster) {
     matches.map(async (m) => {
       let scrapeResult = null;
       if (m.url) {
-        scrapeResult = await scrapePortfolio(m.url);
+        scrapeResult = await scrapePortfolio(m.url, m.name);
       }
 
       // Use manual photo if provided, otherwise use og:image from scrape
@@ -1179,6 +1290,9 @@ async function enrichRecommendations(names, roster) {
 
 async function enrichProfileImages() {
   console.log("📸 Profile Image Enrichment: starting...");
+
+  // Clear portfolio cache so images are re-scraped with latest scoring logic
+  portfolioCache.clear();
 
   try {
     // Need to read fresh data (bypass cache) to see current Profile Image column
@@ -1239,7 +1353,7 @@ async function enrichProfileImages() {
       const item = updates[i];
 
       try {
-        const result = await scrapePortfolio(item.portfolio);
+        const result = await scrapePortfolio(item.portfolio, item.name);
         if (result && result.imageUrl) {
           // Write the image URL to the sheet
           const colLetter = String.fromCharCode(65 + item.colIndex); // A=0, B=1, etc.
