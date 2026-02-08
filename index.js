@@ -2032,25 +2032,44 @@ slack.event("app_mention", async ({ event, say }) => {
       (async () => {
         try {
           const enrichment = await enrichRecommendations(recommendedNames, roster);
+          const hasImages = enrichment.images && Object.keys(enrichment.images).length > 0;
 
-          // Update the main message with portfolio insights text
-          if (enrichment.text) {
+          if (hasImages) {
+            // Build the full recommendation as Slack blocks with inline profile images
+            // chat.update with blocks returns 500, so we post a NEW message with blocks
+            // and update the original to a short pointer
+            const fullText = enrichment.text ? reply + enrichment.text : reply;
+            const blocks = buildSlackBlocks(fullText, enrichment.images, enrichment.text);
+
+            if (blocks && blocks.length > 0) {
+              // Post the rich blocks version as a reply in the thread
+              await slack.client.chat.postMessage({
+                channel: event.channel,
+                thread_ts: event.ts,
+                blocks: blocks,
+                text: reply, // fallback for notifications
+              });
+
+              // Update the original thinking message to a short pointer
+              await slack.client.chat.update({
+                channel: event.channel,
+                ts: thinking.ts,
+                text: "✅ Recommendations posted in thread — see below for details and profile photos.",
+              });
+            } else {
+              // Blocks failed to build — fall back to plain text with portfolio insights
+              await slack.client.chat.update({
+                channel: event.channel,
+                ts: thinking.ts,
+                text: enrichment.text ? reply + enrichment.text : reply,
+              });
+            }
+          } else if (enrichment.text) {
+            // No images but we have portfolio insights — append text
             await slack.client.chat.update({
               channel: event.channel,
               ts: thinking.ts,
               text: reply + enrichment.text,
-            });
-          }
-
-          // Post profile images as a follow-up message in the thread
-          // (chat.update with blocks returns 500, so we use a new message)
-          const followUpBlocks = buildFollowUpBlocks(enrichment.images, "");
-          if (followUpBlocks.length > 0) {
-            await slack.client.chat.postMessage({
-              channel: event.channel,
-              thread_ts: event.ts,
-              blocks: followUpBlocks,
-              text: "📷 Profile photos for recommended freelancers",
             });
           }
         } catch (e) {
@@ -2134,24 +2153,38 @@ slack.event("message", async ({ event, say }) => {
       (async () => {
         try {
           const enrichment = await enrichRecommendations(recommendedNames, roster);
+          const hasImages = enrichment.images && Object.keys(enrichment.images).length > 0;
 
-          // Update the main message with portfolio insights text
-          if (enrichment.text) {
+          if (hasImages) {
+            const fullText = enrichment.text ? reply + enrichment.text : reply;
+            const blocks = buildSlackBlocks(fullText, enrichment.images, enrichment.text);
+
+            if (blocks && blocks.length > 0) {
+              // In DMs there's no threading — just post the blocks version
+              await slack.client.chat.postMessage({
+                channel: event.channel,
+                blocks: blocks,
+                text: reply,
+              });
+
+              // Shorten the original to avoid duplication
+              await slack.client.chat.update({
+                channel: event.channel,
+                ts: thinking.ts,
+                text: "✅ See my recommendations with profile photos below.",
+              });
+            } else {
+              await slack.client.chat.update({
+                channel: event.channel,
+                ts: thinking.ts,
+                text: enrichment.text ? reply + enrichment.text : reply,
+              });
+            }
+          } else if (enrichment.text) {
             await slack.client.chat.update({
               channel: event.channel,
               ts: thinking.ts,
               text: reply + enrichment.text,
-            });
-          }
-
-          // Post profile images as a follow-up message
-          const followUpBlocks = buildFollowUpBlocks(enrichment.images, "");
-          if (followUpBlocks.length > 0) {
-            await slack.client.chat.postMessage({
-              channel: event.channel,
-              thread_ts: thinking.ts,
-              blocks: followUpBlocks,
-              text: "📷 Profile photos for recommended freelancers",
             });
           }
         } catch (e) {
