@@ -1429,6 +1429,113 @@ async function enrichProfileImages() {
   }
 }
 
+// ── Look up a freelancer's profile image from the roster (instant, no scraping) ──
+
+function getImageFromRoster(name, roster) {
+  const person = roster.find(
+    (p) => p.Name && normalizeName(p.Name) === normalizeName(name)
+  );
+  if (!person) return null;
+  const url = person["Profile Image"] || person["Profile Image URL"] || person["Image"] || person.Photo || person["Photo URL"] || "";
+  if (!url.trim()) return null;
+  // Filter out obvious non-headshots
+  const lower = url.toLowerCase();
+  if (["logo", "favicon", "icon", "badge", "banner", "placeholder", "default"].some((p) => lower.includes(p))) return null;
+  return url.trim().startsWith("http://") ? url.trim().replace("http://", "https://") : url.trim();
+}
+
+// ── Post a recommendation reply as structured per-person messages with inline images ──
+
+async function postRecommendationWithImages(channel, threadTs, reply, roster, slackClient) {
+  const medalsByRank = { "1": "🥇", "2": "🥈", "3": "🥉" };
+
+  // Split the reply into: intro (before first medal), per-person sections, trailing note
+  const medalStarts = [];
+  const medalSplitPattern = /[🥇🥈🥉]\s*\*?#\d+/gu;
+  let m;
+  while ((m = medalSplitPattern.exec(reply)) !== null) {
+    medalStarts.push(m.index);
+  }
+
+  if (medalStarts.length === 0) {
+    // No structured recommendations — just post as plain text
+    await slackClient.chat.postMessage({ channel, thread_ts: threadTs, text: reply });
+    return;
+  }
+
+  // Intro = everything before first medal (internal team section, divider)
+  const intro = reply.substring(0, medalStarts[0]).trim();
+
+  // Per-person sections
+  const personSections = [];
+  for (let i = 0; i < medalStarts.length; i++) {
+    const start = medalStarts[i];
+    const end = i + 1 < medalStarts.length ? medalStarts[i + 1] : reply.length;
+    let sectionText = reply.substring(start, end).trim();
+
+    // Check for trailing 💡 Note in the last section
+    let noteText = null;
+    const noteIdx = sectionText.indexOf("💡");
+    if (noteIdx > 0) {
+      noteText = sectionText.substring(noteIdx).trim();
+      sectionText = sectionText.substring(0, noteIdx).trim();
+    }
+
+    // Extract name and rank using /u flag
+    const nameMatch = sectionText.match(/[🥇🥈🥉]\s*\*?#(\d+)\s*—\s*(.+?)\*/u);
+    const rank = nameMatch ? nameMatch[1] : null;
+    const name = nameMatch ? nameMatch[2].trim() : null;
+
+    personSections.push({ text: sectionText, name, rank, noteText });
+  }
+
+  // 1) Post intro section (internal team + divider) as plain text
+  if (intro) {
+    await slackClient.chat.postMessage({ channel, thread_ts: threadTs, text: intro });
+  }
+
+  // 2) Post each recommended person as a block message with image
+  for (const section of personSections) {
+    const imageUrl = section.name ? getImageFromRoster(section.name, roster) : null;
+
+    // Truncate section text if needed (Slack section block max is 3000 chars)
+    let blockText = section.text;
+    if (blockText.length > 2900) blockText = blockText.substring(0, 2900) + "...";
+
+    const block = {
+      type: "section",
+      text: { type: "mrkdwn", text: blockText },
+    };
+
+    if (imageUrl) {
+      block.accessory = {
+        type: "image",
+        image_url: imageUrl,
+        alt_text: section.name || "Profile photo",
+      };
+    }
+
+    try {
+      await slackClient.chat.postMessage({
+        channel,
+        thread_ts: threadTs,
+        blocks: [block],
+        text: section.text,
+      });
+      if (imageUrl) console.log(`📸 Posted ${section.name} with inline image ✅`);
+    } catch (err) {
+      // Fallback: post as plain text if blocks fail
+      console.warn(`📸 Block failed for ${section.name}: ${err.message} — falling back to text`);
+      await slackClient.chat.postMessage({ channel, thread_ts: threadTs, text: section.text });
+    }
+
+    // Post the trailing note if this section had one
+    if (section.noteText) {
+      await slackClient.chat.postMessage({ channel, thread_ts: threadTs, text: section.noteText });
+    }
+  }
+}
+
 // ── Extract recommended names from Claude's response ─────────────────
 
 function extractNamesFromReply(reply) {
@@ -2087,46 +2194,29 @@ slack.event("app_mention", async ({ event, say }) => {
     const reply =
       response.content?.[0]?.text || "No recommendation could be generated.";
 
-    // Send the recommendation immediately
+    // Update the thinking message to a short pointer
     await slack.client.chat.update({
       channel: event.channel,
       ts: thinking.ts,
-      text: reply,
+      text: "✅ Here are my recommendations:",
     });
 
-    // Portfolio + image enrichment in the background (fire-and-forget)
+    // Post each recommended person as their own message with inline profile image
+    await postRecommendationWithImages(event.channel, threadTs, reply, roster, slack.client);
+
+    // Portfolio enrichment in the background (fire-and-forget) — appends portfolio insights as a follow-up
     const recommendedNames = extractNamesFromReply(reply);
     if (recommendedNames.length > 0) {
       (async () => {
         try {
           const enrichment = await enrichRecommendations(recommendedNames, roster);
-
-          // Always update the main message with portfolio insights if we have them
           if (enrichment.text) {
-            await slack.client.chat.update({
+            await slack.client.chat.postMessage({
               channel: event.channel,
-              ts: thinking.ts,
-              text: reply + enrichment.text,
+              thread_ts: threadTs,
+              text: enrichment.text,
             });
-          }
-
-          // Post profile photo cards individually in the thread (one message per person)
-          const hasImages = enrichment.images && Object.keys(enrichment.images).length > 0;
-          if (hasImages) {
-            const profileCards = buildProfileCardBlocks(reply, enrichment.images);
-            for (const card of profileCards) {
-              try {
-                await slack.client.chat.postMessage({
-                  channel: event.channel,
-                  thread_ts: event.ts,
-                  blocks: [card],
-                  text: card.accessory ? `Photo: ${card.accessory.alt_text}` : "Profile photo",
-                });
-                console.log(`📸 Card posted for ${card.accessory?.alt_text} ✅`);
-              } catch (cardErr) {
-                console.warn(`📸 Card failed: ${cardErr.message}`);
-              }
-            }
+            console.log("📂 Portfolio insights posted as follow-up in thread");
           }
         } catch (e) {
           console.warn("Portfolio enrichment failed:", e.message);
@@ -2196,46 +2286,29 @@ slack.event("message", async ({ event, say }) => {
     const reply =
       response.content?.[0]?.text || "No recommendation could be generated.";
 
-    // Send the recommendation immediately
+    // Update the thinking message to a short pointer
     await slack.client.chat.update({
       channel: event.channel,
       ts: thinking.ts,
-      text: reply,
+      text: "✅ Here are my recommendations:",
     });
 
-    // Portfolio + image enrichment in the background (fire-and-forget)
+    // Post each recommended person as their own message with inline profile image
+    await postRecommendationWithImages(event.channel, thinking.ts, reply, roster, slack.client);
+
+    // Portfolio enrichment in the background (fire-and-forget) — appends portfolio insights as a follow-up
     const recommendedNames = extractNamesFromReply(reply);
     if (recommendedNames.length > 0) {
       (async () => {
         try {
           const enrichment = await enrichRecommendations(recommendedNames, roster);
-
-          // Update the main message with portfolio insights
           if (enrichment.text) {
-            await slack.client.chat.update({
+            await slack.client.chat.postMessage({
               channel: event.channel,
-              ts: thinking.ts,
-              text: reply + enrichment.text,
+              thread_ts: thinking.ts,
+              text: enrichment.text,
             });
-          }
-
-          // Post profile photo cards individually
-          const hasImages = enrichment.images && Object.keys(enrichment.images).length > 0;
-          if (hasImages) {
-            const profileCards = buildProfileCardBlocks(reply, enrichment.images);
-            for (const card of profileCards) {
-              try {
-                await slack.client.chat.postMessage({
-                  channel: event.channel,
-                  thread_ts: thinking.ts,
-                  blocks: [card],
-                  text: card.accessory ? `Photo: ${card.accessory.alt_text}` : "Profile photo",
-                });
-                console.log(`📸 DM card posted for ${card.accessory?.alt_text} ✅`);
-              } catch (cardErr) {
-                console.warn(`📸 DM card failed: ${cardErr.message}`);
-              }
-            }
+            console.log("📂 [DM] Portfolio insights posted as follow-up");
           }
         } catch (e) {
           console.warn("Portfolio enrichment failed:", e.message);
