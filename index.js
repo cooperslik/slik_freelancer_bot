@@ -2276,72 +2276,84 @@ slack.action("reject_submission", async ({ body, ack }) => {
 const TALENT_SCOUT_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const seenTalentNames = new Set(); // In-memory dedup — persisted via Google Sheet tab
 
+// Launch a headless browser for scraping JS-rendered sites
+async function launchBrowser() {
+  const puppeteer = require("puppeteer");
+  return puppeteer.launch({
+    headless: "new",
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+      "--single-process",
+    ],
+  });
+}
+
 // Scrape a single directory page for freelancer profile links and basic info
 async function scrapeDirectory(url) {
   console.log(`🔍 Talent Scout: scraping ${url}...`);
-  const profiles = [];
+  let browser;
 
   try {
-    const res = await fetch(url, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-AU,en;q=0.9",
-      },
-    });
+    browser = await launchBrowser();
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1280, height: 900 });
 
-    if (!res.ok) {
-      console.warn(`🔍 Talent Scout: ${url} returned ${res.status}`);
-      return profiles;
-    }
+    // Navigate and wait for content to render
+    await page.goto(url, { waitUntil: "networkidle2", timeout: 30000 });
+    // Extra wait for JS-rendered content
+    await new Promise((r) => setTimeout(r, 3000));
 
-    const html = await res.text();
-    const $ = cheerio.load(html);
+    let profiles = [];
 
     // ── NodePro-specific parsing ──
     if (url.includes("nodepro.com.au")) {
-      // NodePro lists artists in card/grid format with links to /artist/...
-      $('a[href*="/artist/"]').each((_, el) => {
-        const $el = $(el);
-        const href = $el.attr("href") || "";
-        const fullUrl = href.startsWith("http") ? href : `https://nodepro.com.au${href}`;
+      profiles = await page.evaluate(() => {
+        const results = [];
+        // Find all artist profile links
+        const links = document.querySelectorAll('a[href*="/artist/"]');
+        links.forEach((el) => {
+          const href = el.getAttribute("href") || "";
+          const fullUrl = href.startsWith("http") ? href : `https://nodepro.com.au${href}`;
 
-        // Try to extract name and role from the card
-        const name = $el.find("h2, h3, .name, [class*='name']").first().text().trim()
-          || $el.text().trim().split("\n")[0]?.trim();
-        const role = $el.find(".role, [class*='role'], [class*='title'], p").first().text().trim() || "";
-        const location = $el.find(".location, [class*='location']").first().text().trim() || "";
+          // Get the card content — name is usually in a heading or prominent text
+          const card = el.closest("[class*='card']") || el.closest("[class*='member']") || el.closest("[class*='artist']") || el;
+          const allText = card.innerText.trim().split("\n").map((s) => s.trim()).filter(Boolean);
 
-        if (name && name.length > 1 && name.length < 60) {
-          profiles.push({
-            name,
-            role,
-            location,
-            profileUrl: fullUrl,
-            source: "NodePro",
-          });
-        }
+          // First meaningful text line is usually the name
+          const name = allText[0] || "";
+          const role = allText[1] || "";
+          const location = allText.find((t) => /sydney|melbourne|brisbane|perth|adelaide|auckland|wellington|australia|nz/i.test(t)) || "";
+
+          if (name && name.length > 1 && name.length < 60) {
+            results.push({ name, role, location, profileUrl: fullUrl, source: "NodePro" });
+          }
+        });
+        return results;
       });
     } else {
       // ── Generic directory parsing ──
-      // Look for common patterns: cards with names, links, roles
-      $("a[href]").each((_, el) => {
-        const $el = $(el);
-        const href = $el.attr("href") || "";
-        const text = $el.text().trim();
-
-        // Heuristic: links that look like profile pages (contain "profile", "artist", "talent", "member", "person")
-        if (/\/(profile|artist|talent|member|person|freelancer)\//i.test(href) && text.length > 1 && text.length < 60) {
-          const fullUrl = href.startsWith("http") ? href : new URL(href, url).href;
-          profiles.push({
-            name: text.split("\n")[0]?.trim() || text,
-            role: "",
-            location: "",
-            profileUrl: fullUrl,
-            source: new URL(url).hostname.replace("www.", ""),
-          });
-        }
-      });
+      profiles = await page.evaluate((sourceUrl) => {
+        const results = [];
+        const links = document.querySelectorAll("a[href]");
+        links.forEach((el) => {
+          const href = el.getAttribute("href") || "";
+          const text = el.innerText.trim();
+          if (/\/(profile|artist|talent|member|person|freelancer)\//i.test(href) && text.length > 1 && text.length < 60) {
+            const fullUrl = href.startsWith("http") ? href : new URL(href, sourceUrl).href;
+            results.push({
+              name: text.split("\n")[0]?.trim() || text,
+              role: "",
+              location: "",
+              profileUrl: fullUrl,
+              source: new URL(sourceUrl).hostname.replace("www.", ""),
+            });
+          }
+        });
+        return results;
+      }, url);
     }
 
     // Deduplicate by profile URL
@@ -2356,42 +2368,38 @@ async function scrapeDirectory(url) {
     return unique;
   } catch (err) {
     console.warn(`🔍 Talent Scout: error scraping ${url}:`, err.message);
-    return profiles;
+    return [];
+  } finally {
+    if (browser) await browser.close().catch(() => {});
   }
 }
 
 // Scrape an individual profile page for more detail
 async function scrapeProfile(profileUrl) {
+  let browser;
   try {
-    const res = await fetch(profileUrl, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-AU,en;q=0.9",
-      },
+    browser = await launchBrowser();
+    const page = await browser.newPage();
+    await page.goto(profileUrl, { waitUntil: "networkidle2", timeout: 20000 });
+    await new Promise((r) => setTimeout(r, 2000));
+
+    const data = await page.evaluate(() => {
+      const title = document.title || "";
+      const metaDesc = document.querySelector('meta[name="description"]')?.content || "";
+      const ogDesc = document.querySelector('meta[property="og:description"]')?.content || "";
+
+      // Remove noise
+      document.querySelectorAll("script, style, nav, footer, header").forEach((el) => el.remove());
+      const bodyText = document.body.innerText.replace(/\s+/g, " ").trim().substring(0, 3000);
+
+      return { title, description: ogDesc || metaDesc, bodyText };
     });
 
-    if (!res.ok) return null;
-
-    const html = await res.text();
-    const $ = cheerio.load(html);
-
-    // Extract common profile fields
-    const title = $("title").text().trim();
-    const metaDesc = $('meta[name="description"]').attr("content") || "";
-    const ogDesc = $('meta[property="og:description"]').attr("content") || "";
-
-    // Pull all visible text from the main content area
-    $("script, style, nav, footer, header").remove();
-    const bodyText = $("body").text().replace(/\s+/g, " ").trim().substring(0, 3000);
-
-    return {
-      title,
-      description: ogDesc || metaDesc,
-      bodyText,
-    };
+    return data;
   } catch (err) {
     return null;
+  } finally {
+    if (browser) await browser.close().catch(() => {});
   }
 }
 

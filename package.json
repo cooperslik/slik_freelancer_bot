@@ -14,7 +14,8 @@
     "cheerio": "^1.0.0",
     "dotenv": "^16.4.0",
     "pdf-parse": "^1.1.1",
-    "adm-zip": "^0.5.16"
+    "adm-zip": "^0.5.16",
+    "puppeteer": "^22.0.0"
   },
   "engines": {
     "node": ">=20.0.0"
