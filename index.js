@@ -2105,18 +2105,62 @@ slack.event("app_mention", async ({ event, say }) => {
             });
           }
 
-          // Post profile photo cards as a follow-up in the thread
+          // Post profile photo cards individually in the thread (one message per person)
           const hasImages = enrichment.images && Object.keys(enrichment.images).length > 0;
           if (hasImages) {
-            const profileCards = buildProfileCardBlocks(reply, enrichment.images);
-            if (profileCards.length > 0) {
-              console.log(`📸 Posting ${profileCards.length} profile card(s) in thread`);
+            // Diagnostic: test if ANY block works in this thread
+            try {
+              console.log("📸 TEST: posting hardcoded test block to thread...");
               await slack.client.chat.postMessage({
                 channel: event.channel,
                 thread_ts: event.ts,
-                blocks: profileCards,
-                text: "📷 Profile photos",
+                blocks: [{ type: "section", text: { type: "mrkdwn", text: "📸 *Loading profile photos...*" } }],
+                text: "Loading profile photos...",
               });
+              console.log("📸 TEST: hardcoded block worked in thread ✅");
+            } catch (testErr) {
+              console.warn(`📸 TEST: even hardcoded block failed in thread: ${testErr.message}`);
+              // Try without thread_ts
+              try {
+                await slack.client.chat.postMessage({
+                  channel: event.channel,
+                  blocks: [{ type: "section", text: { type: "mrkdwn", text: "📸 *Loading profile photos...*" } }],
+                  text: "Loading profile photos...",
+                });
+                console.log("📸 TEST: block worked WITHOUT thread_ts ✅ — threading is the issue");
+              } catch (testErr2) {
+                console.warn(`📸 TEST: block also failed without thread_ts: ${testErr2.message}`);
+              }
+            }
+
+            const profileCards = buildProfileCardBlocks(reply, enrichment.images);
+            for (const card of profileCards) {
+              try {
+                console.log(`📸 Posting card: ${JSON.stringify(card)}`);
+                await slack.client.chat.postMessage({
+                  channel: event.channel,
+                  thread_ts: event.ts,
+                  blocks: [card],
+                  text: card.accessory ? `Photo: ${card.accessory.alt_text}` : "Profile photo",
+                });
+                console.log(`📸 Card posted ✅`);
+              } catch (cardErr) {
+                console.warn(`📸 Card FAILED: ${cardErr.message}`);
+                console.warn(`📸 Failed block JSON: ${JSON.stringify(card)}`);
+                // Try without image accessory to isolate the issue
+                try {
+                  const textOnly = { type: "section", text: card.text };
+                  await slack.client.chat.postMessage({
+                    channel: event.channel,
+                    thread_ts: event.ts,
+                    blocks: [textOnly],
+                    text: "Profile card (no image)",
+                  });
+                  console.warn(`📸 Text-only version worked — image URL is the problem: ${card.accessory?.image_url}`);
+                } catch (textErr) {
+                  console.warn(`📸 Even text-only failed: ${textErr.message}`);
+                }
+              }
             }
           }
         } catch (e) {
@@ -2210,18 +2254,22 @@ slack.event("message", async ({ event, say }) => {
             });
           }
 
-          // Post profile photo cards as a follow-up
+          // Post profile photo cards individually
           const hasImages = enrichment.images && Object.keys(enrichment.images).length > 0;
           if (hasImages) {
             const profileCards = buildProfileCardBlocks(reply, enrichment.images);
-            if (profileCards.length > 0) {
-              console.log(`📸 Posting ${profileCards.length} profile card(s) in DM`);
-              await slack.client.chat.postMessage({
-                channel: event.channel,
-                thread_ts: thinking.ts,
-                blocks: profileCards,
-                text: "📷 Profile photos",
-              });
+            for (const card of profileCards) {
+              try {
+                console.log(`📸 Posting DM card: ${JSON.stringify(card).substring(0, 200)}`);
+                await slack.client.chat.postMessage({
+                  channel: event.channel,
+                  thread_ts: thinking.ts,
+                  blocks: [card],
+                  text: card.accessory ? `Photo: ${card.accessory.alt_text}` : "Profile photo",
+                });
+              } catch (cardErr) {
+                console.warn(`📸 DM card post failed: ${cardErr.message} | Block: ${JSON.stringify(card)}`);
+              }
             }
           }
         } catch (e) {
